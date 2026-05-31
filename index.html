@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trading Dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117; --bg2: #161b22; --bg3: #21262d; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e;
+    --green: #3fb950; --red: #f85149; --blue: #58a6ff; --orange: #d29922; --purple: #a371f7;
+    --ibkr: #f97316; --fidelity: #22c55e; --rh: #ef4444; --schwab: #3b82f6;
+    --radius: 8px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: 'SF Mono','Cascadia Code','Fira Code',monospace; font-size: 13px; min-height: 100vh; }
+  .shell { display: flex; flex-direction: column; min-height: 100vh; }
+  .topbar { display: flex; align-items: center; gap: 12px; padding: 12px 20px; background: var(--bg2); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 10; flex-wrap: wrap; }
+  .logo { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 700; letter-spacing: -0.5px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); }
+  .dot.red { background: var(--red); box-shadow: 0 0 8px var(--red); }
+  .dot.orange { background: var(--orange); box-shadow: 0 0 8px var(--orange); }
+  .spacer { flex: 1; }
+  .sync-status { font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  .sync-status.ok { color: var(--green); }
+  .sync-status.err { color: var(--red); }
+  .sync-status.loading { color: var(--orange); }
+  .nav { display: flex; gap: 2px; }
+  .nav-btn { background: transparent; border: 1px solid transparent; color: var(--muted); padding: 6px 14px; border-radius: var(--radius); cursor: pointer; font-family: inherit; font-size: 12px; transition: all 0.15s; }
+  .nav-btn:hover { color: var(--text); background: var(--bg3); }
+  .nav-btn.active { color: var(--text); background: var(--bg3); border-color: var(--border); }
+  .content { padding: 20px; flex: 1; max-width: 1400px; margin: 0 auto; width: 100%; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 20px; }
+  .metric { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; }
+  .metric-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 6px; }
+  .metric-val { font-size: 22px; font-weight: 700; letter-spacing: -1px; }
+  .metric-val.green { color: var(--green); } .metric-val.red { color: var(--red); } .metric-val.blue { color: var(--blue); }
+  .acct-tabs { display: flex; gap: 6px; margin-bottom: 16px; flex-wrap: wrap; }
+  .acct-tab { font-family: inherit; font-size: 11px; padding: 5px 12px; border-radius: 20px; border: 1px solid var(--border); background: transparent; color: var(--muted); cursor: pointer; transition: all 0.15s; }
+  .acct-tab:hover { border-color: var(--text); color: var(--text); }
+  .acct-tab.active { color: #000; font-weight: 700; border-color: transparent; }
+  .acct-tab.all.active { background: var(--text); }
+  .acct-tab.ibkr.active { background: var(--ibkr); } .acct-tab.fidelity.active { background: var(--fidelity); }
+  .acct-tab.rh.active { background: var(--rh); } .acct-tab.schwab.active { background: var(--schwab); }
+  .tbl-wrap { border: 1px solid var(--border); border-radius: var(--radius); overflow-x: auto; margin-bottom: 20px; }
+  table { width: 100%; border-collapse: collapse; }
+  thead th { background: var(--bg2); color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.8px; padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  tbody td { padding: 9px 12px; border-bottom: 1px solid var(--border); white-space: nowrap; font-size: 12px; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: var(--bg2); }
+  .day-header { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; margin-bottom: 6px; border-bottom: 1px solid var(--border); }
+  .day-label { font-size: 12px; color: var(--muted); }
+  .chip { font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 4px; display: inline-block; }
+  .chip-ibkr { background: #7c2d12; color: var(--ibkr); } .chip-fidelity { background: #14532d; color: var(--fidelity); }
+  .chip-rh { background: #7f1d1d; color: var(--rh); } .chip-schwab { background: #1e3a5f; color: var(--schwab); }
+  .badge { font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 4px; display: inline-block; }
+  .badge-buy { background: #0c2d48; color: var(--blue); } .badge-sell { background: #2d1b00; color: var(--orange); } .badge-spread { background: #1e1b4b; color: var(--purple); }
+  .pos { color: var(--green); } .neg { color: var(--red); } .muted { color: var(--muted); }
+  .filter-bar { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; align-items: center; }
+  .filter-bar input, .filter-bar select { background: var(--bg2); border: 1px solid var(--border); color: var(--text); font-family: inherit; font-size: 12px; padding: 6px 10px; border-radius: var(--radius); height: 32px; outline: none; }
+  .filter-bar input:focus, .filter-bar select:focus { border-color: var(--blue); }
+  .filter-bar input { min-width: 120px; }
+  .filter-bar select option { background: var(--bg2); }
+  .btn { background: var(--bg3); border: 1px solid var(--border); color: var(--text); font-family: inherit; font-size: 12px; padding: 6px 12px; border-radius: var(--radius); cursor: pointer; transition: all 0.15s; height: 32px; display: inline-flex; align-items: center; gap: 5px; }
+  .btn:hover { border-color: var(--text); } .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-green { border-color: var(--green); color: var(--green); } .btn-green:hover { background: #0d2a0d; }
+  .btn-blue { border-color: var(--blue); color: var(--blue); } .btn-blue:hover { background: #0d1a2a; }
+  .btn-red { border-color: var(--red); color: var(--red); } .btn-red:hover { background: #2a0d0d; }
+  .import-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 20px; }
+  .upload-card { background: var(--bg2); border: 2px dashed var(--border); border-radius: var(--radius); padding: 24px; text-align: center; cursor: pointer; transition: all 0.2s; }
+  .upload-card:hover { border-style: solid; }
+  .upload-card.ibkr:hover { border-color: var(--ibkr); } .upload-card.fidelity:hover { border-color: var(--fidelity); }
+  .upload-card.rh:hover { border-color: var(--rh); } .upload-card.schwab:hover { border-color: var(--schwab); }
+  .upload-card input[type=file] { display: none; }
+  .upload-icon { font-size: 28px; margin-bottom: 8px; }
+  .upload-broker { font-size: 14px; font-weight: 700; margin-bottom: 4px; }
+  .upload-hint { font-size: 11px; color: var(--muted); }
+  .upload-count { font-size: 11px; margin-top: 8px; color: var(--green); }
+  .info-box { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; }
+  .info-box h3 { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 12px; }
+  .info-row { display: flex; gap: 8px; margin-bottom: 8px; font-size: 12px; align-items: baseline; }
+  .info-row .bname { font-weight: 700; min-width: 80px; }
+  .info-row.ibkr .bname { color: var(--ibkr); } .info-row.fidelity .bname { color: var(--fidelity); }
+  .info-row.rh .bname { color: var(--rh); } .info-row.schwab .bname { color: var(--schwab); }
+  .broker-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin-bottom: 20px; }
+  .bcard { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; }
+  .bcard-header { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; }
+  .bcard-dot { width: 8px; height: 8px; border-radius: 50%; }
+  .bcard-name { font-size: 12px; font-weight: 700; }
+  .bcard-row { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+  .bcard-row span:last-child { color: var(--text); font-weight: 600; }
+  .empty { text-align: center; padding: 50px; color: var(--muted); }
+  .empty-icon { font-size: 36px; margin-bottom: 10px; }
+  .spread-pill { font-size: 9px; background: #1e1b4b; color: var(--purple); border-radius: 3px; padding: 1px 4px; margin-left: 4px; vertical-align: middle; }
+  /* Setup wizard */
+  .setup-wizard { max-width: 700px; }
+  .step { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; margin-bottom: 14px; }
+  .step-num { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; border-radius: 50%; background: var(--blue); color: #000; font-size: 11px; font-weight: 700; margin-right: 8px; }
+  .step h3 { display: inline; font-size: 13px; font-weight: 700; }
+  .step p { color: var(--muted); font-size: 12px; margin-top: 10px; line-height: 1.8; }
+  .step code { background: var(--bg3); color: var(--green); padding: 2px 6px; border-radius: 4px; font-family: inherit; font-size: 12px; }
+  .step .url-box { background: var(--bg3); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 14px; margin-top: 10px; display: flex; align-items: center; gap: 8px; }
+  .step .url-box input { background: transparent; border: none; color: var(--blue); font-family: inherit; font-size: 12px; flex: 1; outline: none; }
+  .step .url-box button { font-size: 11px; }
+  .step .img-hint { font-size: 11px; color: var(--muted); margin-top: 6px; font-style: italic; }
+  .connected-banner { background: #0d2a0d; border: 1px solid var(--green); border-radius: var(--radius); padding: 14px 18px; margin-bottom: 20px; display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--green); }
+  .cash-editor { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin-bottom: 14px; }
+  .cash-row { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; display: flex; align-items: center; gap: 10px; }
+  .cash-row label { font-size: 12px; font-weight: 700; min-width: 70px; }
+  .cash-row input { background: var(--bg3); border: 1px solid var(--border); color: var(--text); font-family: inherit; font-size: 13px; padding: 5px 8px; border-radius: var(--radius); flex: 1; outline: none; }
+  .cash-row input:focus { border-color: var(--blue); }
+  @media (max-width: 600px) { .import-grid { grid-template-columns: 1fr; } .topbar { flex-wrap: wrap; } }
+</style>
+</head>
+<body>
+<div class="shell">
+  <div class="topbar">
+    <div class="logo"><span class="dot" id="conn-dot"></span> TRADE//LOG</div>
+    <div class="sync-status" id="sync-status">not connected</div>
+    <div class="spacer"></div>
+    <button class="btn btn-blue" onclick="syncNow()" id="sync-btn" style="font-size:11px">↺ Sync</button>
+    <div class="nav">
+      <button class="nav-btn active" onclick="showPage('activity')">Activity</button>
+      <button class="nav-btn" onclick="showPage('positions')">Positions</button>
+      <button class="nav-btn" onclick="showPage('import')">Import CSV</button>
+      <button class="nav-btn" onclick="showPage('setup')">⚙ Setup</button>
+    </div>
+  </div>
+  <div class="content" id="content"></div>
+</div>
+
+<script>
+const BROKERS = { ibkr:'IBKR', fidelity:'Fidelity', rh:'Robinhood', schwab:'Schwab' };
+const COLORS  = { ibkr:'#f97316', fidelity:'#22c55e', rh:'#ef4444', schwab:'#3b82f6' };
+
+let state = {
+  page: 'setup',
+  acct: 'all',
+  dateFilter: '',
+  symFilter: '',
+  trades: [],
+  positions: [],
+  balances: { ibkr:0, fidelity:0, rh:0, schwab:0 },
+  scriptUrl: localStorage.getItem('scriptUrl') || '',
+  connected: false,
+  syncing: false,
+  lastSync: null
+};
+
+// ── Formatting helpers ────────────────────────────────────────
+const fmt     = n => n==null ? '—' : '$'+Math.abs(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+const fmtSign = n => { if(n==null) return '—'; return (n>=0?'+$':'-$')+Math.abs(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}); };
+const cls     = n => n==null?'':(n>=0?'pos':'neg');
+const chip    = b => `<span class="chip chip-${b}">${BROKERS[b]}</span>`;
+const badge   = a => `<span class="badge badge-${a==='BUY'?'buy':a==='SELL'?'sell':'spread'}">${a}</span>`;
+const fmtDate = d => new Date(d+'T12:00:00').toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'});
+
+// ── Google Sheets API ─────────────────────────────────────────
+async function api(params, body) {
+  if (!state.scriptUrl) throw new Error('No script URL configured');
+  const url = state.scriptUrl + '?' + new URLSearchParams(params);
+  const res = await fetch(url, body ? {
+    method: 'POST',
+    body: JSON.stringify(body),
+    headers: { 'Content-Type': 'text/plain' }   // Apps Script requires text/plain for POST
+  } : { method: 'GET' });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  return res.json();
+}
+
+async function syncNow() {
+  if (!state.scriptUrl) { showPage('setup'); return; }
+  setSyncStatus('loading', '↺ syncing…');
+  try {
+    const data = await api({ action: 'getAll' });
+    if (!data.ok) throw new Error(data.msg);
+    if (Array.isArray(data.trades))    state.trades    = data.trades;
+    if (Array.isArray(data.positions)) state.positions = data.positions;
+    if (data.balances && typeof data.balances === 'object') state.balances = data.balances;
+    state.connected = true;
+    state.lastSync  = new Date();
+    setSyncStatus('ok', '✓ synced ' + state.lastSync.toLocaleTimeString());
+    render();
+  } catch(e) {
+    setSyncStatus('err', '✗ ' + e.message);
+  }
+}
+
+async function pushTrades() {
+  try {
+    await api({}, { action: 'saveTrades', data: state.trades });
+    await api({}, { action: 'saveBalances', data: state.balances });
+    state.lastSync = new Date();
+    setSyncStatus('ok', '✓ saved ' + state.lastSync.toLocaleTimeString());
+  } catch(e) {
+    setSyncStatus('err', '✗ save failed: ' + e.message);
+  }
+}
+
+async function pushAll() {
+  try {
+    await api({}, { action: 'saveTrades',    data: state.trades });
+    await api({}, { action: 'savePositions', data: state.positions });
+    await api({}, { action: 'saveBalances',  data: state.balances });
+    state.lastSync = new Date();
+    setSyncStatus('ok', '✓ saved ' + state.lastSync.toLocaleTimeString());
+  } catch(e) {
+    setSyncStatus('err', '✗ save failed: ' + e.message);
+  }
+}
+
+async function testConnection() {
+  const url = document.getElementById('url-input').value.trim();
+  if (!url) { alert('Paste your Web App URL first'); return; }
+  setSyncStatus('loading', '↺ testing…');
+  try {
+    state.scriptUrl = url;
+    localStorage.setItem('scriptUrl', url);
+    const data = await api({ action: 'ping' });
+    if (!data.ok) throw new Error(data.msg);
+    state.connected = true;
+    setSyncStatus('ok', '✓ connected!');
+    await syncNow();
+    showPage('activity');
+  } catch(e) {
+    setSyncStatus('err', '✗ ' + e.message);
+    state.connected = false;
+  }
+}
+
+function setSyncStatus(type, msg) {
+  const el = document.getElementById('sync-status');
+  const dot = document.getElementById('conn-dot');
+  el.className = 'sync-status ' + type;
+  el.textContent = msg;
+  dot.className = 'dot ' + (type === 'ok' ? '' : type === 'loading' ? 'orange' : 'red');
+}
+
+// ── CSV parsers ───────────────────────────────────────────────
+function parseCSV(text) { return text.trim().split('\n').map(l => l.split(',').map(c => c.replace(/^"|"$/g,'').trim())); }
+
+function parseIBKR(text) {
+  return parseCSV(text).slice(1).filter(r=>r.length>=6&&r[1]).map((r,i)=>({
+    id:'ibkr-'+Date.now()+i, date:r[0].slice(0,10), broker:'ibkr',
+    symbol:r[1], type:r[1].includes(' ')?'option':'stock',
+    action:r[2].toUpperCase().includes('BUY')?'BUY':'SELL',
+    qty:Math.abs(parseFloat(r[3])||0), price:parseFloat(r[4])||0,
+    commission:Math.abs(parseFloat(r[5])||0), pnl:null, spreadId:null
+  }));
+}
+function parseFidelity(text) {
+  return parseCSV(text).slice(1).filter(r=>r.length>=7&&r[2]).map((r,i)=>({
+    id:'fid-'+Date.now()+i, date:r[0].slice(0,10), broker:'fidelity',
+    symbol:r[2], type:r[2].includes(' ')?'option':'stock',
+    action:r[1].toLowerCase().includes('buy')?'BUY':'SELL',
+    qty:Math.abs(parseFloat(r[4])||0), price:parseFloat(r[5])||0,
+    commission:Math.abs(parseFloat(r[7])||0), pnl:null, spreadId:null
+  }));
+}
+function parseRH(text) {
+  return parseCSV(text).slice(1).filter(r=>r.length>=6&&r[1]).map((r,i)=>({
+    id:'rh-'+Date.now()+i, date:r[0].slice(0,10), broker:'rh',
+    symbol:r[1], type:r[1].includes(' ')?'option':'stock',
+    action:r[3].toUpperCase().includes('BUY')||r[2].toLowerCase().includes('bought')?'BUY':'SELL',
+    qty:Math.abs(parseFloat(r[4])||0), price:parseFloat(r[5])||0,
+    commission:0, pnl:null, spreadId:null
+  }));
+}
+function parseSchwab(text) {
+  return parseCSV(text).slice(1).filter(r=>r.length>=6&&r[2]).map((r,i)=>({
+    id:'sch-'+Date.now()+i, date:r[0].slice(0,10), broker:'schwab',
+    symbol:r[2], type:r[2].includes(' ')?'option':'stock',
+    action:r[1].toLowerCase().includes('buy')?'BUY':'SELL',
+    qty:Math.abs(parseFloat(r[4])||0), price:parseFloat(r[5])||0,
+    commission:Math.abs(parseFloat(r[6])||0), pnl:null, spreadId:null
+  }));
+}
+const PARSERS = { ibkr:parseIBKR, fidelity:parseFidelity, rh:parseRH, schwab:parseSchwab };
+
+function handleFile(e, broker) {
+  const file = e.target.files[0]; if (!file) return;
+  const reader = new FileReader();
+  reader.onload = async ev => {
+    const newTrades = PARSERS[broker](ev.target.result);
+    state.trades = state.trades.filter(t => t.broker !== broker).concat(newTrades);
+    setSyncStatus('loading', '↺ saving to Sheets…');
+    await pushTrades();
+    showPage('activity');
+  };
+  reader.readAsText(file);
+  e.target.value = '';
+}
+
+// ── Filtered data ─────────────────────────────────────────────
+function filteredTrades() {
+  return state.trades.filter(t => {
+    if (state.acct !== 'all' && t.broker !== state.acct) return false;
+    if (state.dateFilter && t.date !== state.dateFilter) return false;
+    if (state.symFilter && !t.symbol.toLowerCase().includes(state.symFilter.toLowerCase())) return false;
+    return true;
+  });
+}
+function filteredPositions() {
+  return state.positions.filter(p => state.acct === 'all' || p.broker === state.acct);
+}
+
+// ── Shared components ─────────────────────────────────────────
+function acctTabsHTML() {
+  return `<div class="acct-tabs">
+    <button class="acct-tab all ${state.acct==='all'?'active':''}" onclick="setAcct('all')">All Accounts</button>
+    ${Object.entries(BROKERS).map(([k,v])=>`<button class="acct-tab ${k} ${state.acct===k?'active':''}" onclick="setAcct('${k}')">${v}</button>`).join('')}
+  </div>`;
+}
+
+function connectionBanner() {
+  if (!state.connected) return `<div style="background:#2a1500;border:1px solid var(--orange);border-radius:var(--radius);padding:12px 16px;margin-bottom:16px;font-size:12px;color:var(--orange)">
+    ⚠ Not connected to Google Sheets. <button class="btn" onclick="showPage('setup')" style="margin-left:8px;font-size:11px">Go to Setup →</button>
+  </div>`;
+  return '';
+}
+
+// ── Activity page ─────────────────────────────────────────────
+function renderActivity() {
+  const trades = filteredTrades();
+  const closed = trades.filter(t => t.pnl != null);
+  const realPnl = closed.reduce((s,t)=>s+Number(t.pnl),0);
+  const comm    = trades.reduce((s,t)=>s+Number(t.commission),0);
+  const wins    = closed.filter(t=>Number(t.pnl)>0).length;
+  const winRate = closed.length ? Math.round(wins/closed.length*100) : 0;
+  const cash    = state.acct==='all' ? Object.values(state.balances).reduce((a,b)=>a+Number(b),0) : Number(state.balances[state.acct])||0;
+  const unrealPnl = filteredPositions().reduce((s,p)=>s+Number(p.unrealPnl),0);
+
+  const byDate = {};
+  trades.forEach(t=>{ if(!byDate[t.date]) byDate[t.date]=[]; byDate[t.date].push(t); });
+  const dates = Object.keys(byDate).sort((a,b)=>b.localeCompare(a));
+
+  return `
+  ${connectionBanner()}
+  ${acctTabsHTML()}
+  <div class="metrics">
+    <div class="metric"><div class="metric-label">Cash Balance</div><div class="metric-val blue">${fmt(cash)}</div></div>
+    <div class="metric"><div class="metric-label">Realized P&amp;L</div><div class="metric-val ${realPnl>=0?'green':'red'}">${fmtSign(realPnl)}</div></div>
+    <div class="metric"><div class="metric-label">Unrealized P&amp;L</div><div class="metric-val ${unrealPnl>=0?'green':'red'}">${fmtSign(unrealPnl)}</div></div>
+    <div class="metric"><div class="metric-label">Commissions</div><div class="metric-val red">-${fmt(comm)}</div></div>
+    <div class="metric"><div class="metric-label">Win Rate</div><div class="metric-val ${winRate>=50?'green':'red'}">${winRate}%</div></div>
+    <div class="metric"><div class="metric-label">Closed Trades</div><div class="metric-val">${closed.length}</div></div>
+  </div>
+  <div class="filter-bar">
+    <input type="date" value="${state.dateFilter}" onchange="state.dateFilter=this.value;render()"/>
+    <input type="text" placeholder="Symbol..." value="${state.symFilter}" oninput="state.symFilter=this.value;render()" style="flex:1;max-width:180px"/>
+    <button class="btn" onclick="state.dateFilter='';state.symFilter='';render()">✕ Clear</button>
+  </div>
+  ${dates.length===0?`<div class="empty"><div class="empty-icon">📭</div>No trades yet. Go to <strong>Import CSV</strong> to load your first file.</div>`:''}
+  ${dates.map(d=>{
+    const dt=byDate[d];
+    const dPnl=dt.filter(t=>t.pnl!=null).reduce((s,t)=>s+Number(t.pnl),0);
+    const dComm=dt.reduce((s,t)=>s+Number(t.commission),0);
+    return `
+    <div class="day-header">
+      <span class="day-label">${fmtDate(d)}</span>
+      <span>P&amp;L: <span class="${cls(dPnl)}">${fmtSign(dPnl)}</span> &nbsp;·&nbsp; Comm: <span class="neg">-${fmt(dComm)}</span></span>
+    </div>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>Account</th><th>Symbol</th><th>Type</th><th>Action</th><th style="text-align:right">Qty</th><th style="text-align:right">Price</th><th style="text-align:right">Commission</th><th style="text-align:right">P&amp;L</th></tr></thead>
+        <tbody>
+        ${dt.map(t=>`<tr>
+          <td>${chip(t.broker)}</td>
+          <td style="font-weight:600">${t.symbol}${t.spreadId?'<span class="spread-pill">SPREAD</span>':''}</td>
+          <td class="muted">${t.type}</td>
+          <td>${badge(t.action)}</td>
+          <td style="text-align:right">${t.qty}</td>
+          <td style="text-align:right">${t.price<0?'-':''}${fmt(Math.abs(t.price))}</td>
+          <td style="text-align:right" class="muted">${t.commission?'-'+fmt(t.commission):'—'}</td>
+          <td style="text-align:right;font-weight:600" class="${cls(t.pnl)}">${fmtSign(t.pnl)}</td>
+        </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>`;
+  }).join('')}`;
+}
+
+// ── Positions page ────────────────────────────────────────────
+function renderPositions() {
+  const pos = filteredPositions();
+  const totalMkt    = pos.reduce((s,p)=>s+Number(p.mktValue),0);
+  const totalUnreal = pos.reduce((s,p)=>s+Number(p.unrealPnl),0);
+  const totalDay    = pos.reduce((s,p)=>s+Number(p.dayPnl),0);
+  return `
+  ${connectionBanner()}
+  ${acctTabsHTML()}
+  <div class="metrics">
+    <div class="metric"><div class="metric-label">Market Value</div><div class="metric-val blue">${fmt(totalMkt)}</div></div>
+    <div class="metric"><div class="metric-label">Unrealized P&amp;L</div><div class="metric-val ${totalUnreal>=0?'green':'red'}">${fmtSign(totalUnreal)}</div></div>
+    <div class="metric"><div class="metric-label">Day P&amp;L</div><div class="metric-val ${totalDay>=0?'green':'red'}">${fmtSign(totalDay)}</div></div>
+    <div class="metric"><div class="metric-label">Open Positions</div><div class="metric-val">${pos.length}</div></div>
+  </div>
+  <div class="broker-summary">
+    ${Object.entries(BROKERS).map(([k,v])=>{
+      const bp=state.positions.filter(p=>p.broker===k);
+      const bmkt=bp.reduce((s,p)=>s+Number(p.mktValue),0);
+      const bunreal=bp.reduce((s,p)=>s+Number(p.unrealPnl),0);
+      const bday=bp.reduce((s,p)=>s+Number(p.dayPnl),0);
+      return `<div class="bcard">
+        <div class="bcard-header"><div class="bcard-dot" style="background:${COLORS[k]}"></div><div class="bcard-name" style="color:${COLORS[k]}">${v}</div></div>
+        <div class="bcard-row"><span>Cash</span><span>${fmt(state.balances[k])}</span></div>
+        <div class="bcard-row"><span>Mkt Value</span><span>${fmt(bmkt)}</span></div>
+        <div class="bcard-row"><span>Unrealized</span><span class="${cls(bunreal)}">${fmtSign(bunreal)}</span></div>
+        <div class="bcard-row"><span>Day P&amp;L</span><span class="${cls(bday)}">${fmtSign(bday)}</span></div>
+        <div class="bcard-row"><span>Positions</span><span>${bp.length}</span></div>
+      </div>`;
+    }).join('')}
+  </div>
+  ${pos.length===0?`<div class="empty"><div class="empty-icon">📂</div>No open positions</div>`:`
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Account</th><th>Symbol</th><th>Type</th><th style="text-align:right">Qty</th><th style="text-align:right">Avg Cost</th><th style="text-align:right">Current</th><th style="text-align:right">Mkt Value</th><th style="text-align:right">Unrealized</th><th style="text-align:right">Day P&amp;L</th></tr></thead>
+    <tbody>
+    ${pos.map(p=>`<tr>
+      <td>${chip(p.broker)}</td>
+      <td style="font-weight:600">${p.symbol}</td>
+      <td class="muted">${p.type}</td>
+      <td style="text-align:right">${p.qty}</td>
+      <td style="text-align:right">${fmt(p.avgCost)}</td>
+      <td style="text-align:right">${fmt(p.currentPrice)}</td>
+      <td style="text-align:right;font-weight:600">${fmt(p.mktValue)}</td>
+      <td style="text-align:right;font-weight:600" class="${cls(p.unrealPnl)}">${fmtSign(p.unrealPnl)}</td>
+      <td style="text-align:right" class="${cls(p.dayPnl)}">${fmtSign(p.dayPnl)}</td>
+    </tr>`).join('')}
+    </tbody>
+  </table></div>`}`;
+}
+
+// ── Import CSV page ───────────────────────────────────────────
+function renderImport() {
+  const counts = {};
+  state.trades.forEach(t=>{ if(t.type!=='spread') counts[t.broker]=(counts[t.broker]||0)+1; });
+  const hints = { ibkr:'Flex Report or Activity Statement CSV', fidelity:'Account activity CSV export', rh:'Stock / option history CSV', schwab:'Transaction history CSV' };
+  const exportSteps = { ibkr:'Reports → Activity → Trade History → Download CSV', fidelity:'Accounts → Activity & Orders → Export to CSV', rh:'Account → Statements & History → Download CSV', schwab:'Accounts → History → Export → CSV' };
+  return `
+  ${connectionBanner()}
+  <p style="color:var(--muted);font-size:12px;margin-bottom:16px">Upload CSV exports — they are parsed in your browser and saved to your Google Sheet automatically.</p>
+  <div class="import-grid">
+    ${Object.entries(BROKERS).map(([k,v])=>`
+    <div class="upload-card ${k}" onclick="document.getElementById('file-${k}').click()">
+      <input type="file" id="file-${k}" accept=".csv,.txt" onchange="handleFile(event,'${k}')">
+      <div class="upload-icon">📤</div>
+      <div class="upload-broker" style="color:${COLORS[k]}">${v}</div>
+      <div class="upload-hint">${hints[k]}</div>
+      ${counts[k]?`<div class="upload-count">✓ ${counts[k]} trades</div>`:''}
+    </div>`).join('')}
+  </div>
+  <div style="margin-bottom:14px">
+    <div class="metric-label" style="margin-bottom:10px">Update cash balances</div>
+    <div class="cash-editor">
+      ${Object.entries(BROKERS).map(([k,v])=>`
+      <div class="cash-row">
+        <label style="color:${COLORS[k]}">${v}</label>
+        <input type="number" step="0.01" value="${Number(state.balances[k]||0).toFixed(2)}"
+          onchange="state.balances['${k}']=parseFloat(this.value)||0" placeholder="0.00" />
+      </div>`).join('')}
+    </div>
+    <button class="btn btn-green" onclick="pushAll()">↑ Save balances to Sheets</button>
+  </div>
+  <div class="info-box">
+    <h3>How to export CSV from each broker</h3>
+    ${Object.entries(BROKERS).map(([k,v])=>`<div class="info-row ${k}"><span class="bname">${v}</span><span class="muted">${exportSteps[k]}</span></div>`).join('')}
+  </div>`;
+}
+
+// ── Setup page ────────────────────────────────────────────────
+function renderSetup() {
+  const saved = state.scriptUrl;
+  return `
+  <div class="setup-wizard">
+    ${state.connected ? `<div class="connected-banner">✓ Connected to Google Sheets &nbsp;·&nbsp; ${state.lastSync ? 'Last sync: '+state.lastSync.toLocaleTimeString() : ''}</div>` : ''}
+
+    <div class="step">
+      <span class="step-num">1</span><h3>Create a Google Sheet</h3>
+      <p>
+        Go to <a href="https://sheets.google.com" target="_blank" style="color:var(--blue)">sheets.google.com</a> and create a new blank spreadsheet.<br>
+        Name it something like <code>Trading Dashboard</code>.<br>
+        Keep the tab open — you'll need it in step 3.
+      </p>
+    </div>
+
+    <div class="step">
+      <span class="step-num">2</span><h3>Open Apps Script</h3>
+      <p>
+        In your Google Sheet, click the menu: <code>Extensions</code> → <code>Apps Script</code><br>
+        A new tab opens with a code editor. Delete any existing code in the editor (it starts with <code>function myFunction() {}</code>).<br>
+        Then paste the entire contents of the <code>Code.gs</code> file you downloaded into the editor.<br>
+        Click the 💾 <strong>Save</strong> button (or press Ctrl+S / Cmd+S).
+      </p>
+    </div>
+
+    <div class="step">
+      <span class="step-num">3</span><h3>Run the setup function</h3>
+      <p>
+        In the Apps Script editor, click the function dropdown (it may say <code>myFunction</code> or <code>doGet</code>) and select <code>setupSheets</code>.<br>
+        Click the ▶ <strong>Run</strong> button.<br>
+        Google will ask for permissions — click <strong>Review Permissions</strong> → choose your Google account → click <strong>Allow</strong>.<br>
+        You should see an alert: <em>"✅ All sheets created successfully!"</em>
+      </p>
+    </div>
+
+    <div class="step">
+      <span class="step-num">4</span><h3>Deploy as Web App</h3>
+      <p>
+        In Apps Script, click <code>Deploy</code> → <code>New deployment</code>.<br>
+        Click the gear ⚙ icon next to "Type" and select <strong>Web app</strong>.<br>
+        Set <strong>Execute as</strong>: <code>Me</code><br>
+        Set <strong>Who has access</strong>: <code>Anyone</code> (no sign-in needed — data is still private)<br>
+        Click <strong>Deploy</strong>. Copy the <strong>Web app URL</strong> that appears.
+      </p>
+    </div>
+
+    <div class="step">
+      <span class="step-num">5</span><h3>Paste your Web App URL here</h3>
+      <p>Paste the URL you just copied and click Connect:</p>
+      <div class="url-box">
+        <input type="text" id="url-input" value="${saved}" placeholder="https://script.google.com/macros/s/.../exec" />
+        <button class="btn btn-green" onclick="testConnection()">Connect →</button>
+      </div>
+      <p class="img-hint">The URL looks like: https://script.google.com/macros/s/AKfycb.../exec</p>
+    </div>
+
+    <div class="step" style="border-color:#1f6feb">
+      <span class="step-num" style="background:var(--muted)">?</span><h3>Free hosting on GitHub Pages</h3>
+      <p>
+        1. Create a free account at <a href="https://github.com" target="_blank" style="color:var(--blue)">github.com</a><br>
+        2. Click <strong>New repository</strong> → name it <code>trading-dashboard</code> → set to <strong>Private</strong><br>
+        3. Upload <code>trading-dashboard.html</code> and rename it to <code>index.html</code><br>
+        4. Go to <strong>Settings → Pages → Source</strong> → Deploy from branch → <code>main</code><br>
+        5. Your dashboard will be live at <code>https://yourusername.github.io/trading-dashboard</code><br><br>
+        Your Google Sheets URL is saved in the browser, so it reconnects automatically when you visit.
+      </p>
+    </div>
+  </div>`;
+}
+
+// ── Navigation ────────────────────────────────────────────────
+function showPage(p) {
+  state.page = p;
+  document.querySelectorAll('.nav-btn').forEach((b,i) => b.classList.toggle('active', ['activity','positions','import','setup'][i]===p));
+  render();
+}
+function setAcct(a) { state.acct = a; render(); }
+
+function render() {
+  const el = document.getElementById('content');
+  if (state.page==='activity')  el.innerHTML = renderActivity();
+  else if (state.page==='positions') el.innerHTML = renderPositions();
+  else if (state.page==='import')    el.innerHTML = renderImport();
+  else el.innerHTML = renderSetup();
+}
+
+// ── Boot ──────────────────────────────────────────────────────
+if (state.scriptUrl) {
+  state.page = 'activity';
+  syncNow();
+} else {
+  state.page = 'setup';
+}
+render();
+</script>
+</body>
+</html>
