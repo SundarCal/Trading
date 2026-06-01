@@ -237,55 +237,452 @@ function setSyncStatus(type, msg) {
 }
 
 // ── CSV parsers ───────────────────────────────────────────────
-function parseCSV(text) { return text.trim().split('\n').map(l => l.split(',').map(c => c.replace(/^"|"$/g,'').trim())); }
 
+// Robust CSV line splitter — handles quoted fields containing commas
+function splitCSVLine(line) {
+  const result = [];
+  let cur = '', inQ = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '"') { inQ = !inQ; }
+    else if (c === ',' && !inQ) { result.push(cur.trim()); cur = ''; }
+    else { cur += c; }
+  }
+  result.push(cur.trim());
+  return result;
+}
+
+function parseCSVLines(text) {
+  return text.trim().split('\n').map(splitCSVLine);
+}
+
+// Normalise a date string to YYYY-MM-DD
+function normaliseDate(raw) {
+  if (!raw) return '';
+  raw = raw.trim();
+  // Already ISO: 2026-05-30 or 20260530
+  if (/^\d{8}$/.test(raw)) return raw.slice(0,4)+'-'+raw.slice(4,6)+'-'+raw.slice(6,8);
+  if (/^\d{4}-\d{2}-\d{2}/.test(raw)) return raw.slice(0,10);
+  // MM/DD/YYYY or MM/DD/YY
+  const m = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+  if (m) {
+    let y = m[3]; if (y.length===2) y = '20'+y;
+    return y+'-'+m[1].padStart(2,'0')+'-'+m[2].padStart(2,'0');
+  }
+  // IBKR datetime: "2026-05-30, 09:45:00" or "2026-05-30;09:45:00"
+  const d2 = raw.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (d2) return d2[1];
+  return raw.slice(0,10);
+}
+
+// Detect if a symbol is an option (contains space + expiry pattern or standard OCC format)
+function detectType(symbol) {
+  if (!symbol) return 'stock';
+  // OCC option format: AAPL  260620C00150000  (21 chars) or shorter variants
+  // Also catch "AAPL 150C 06/20" style descriptions
+  if (/\d{6}[CP]\d{8}/.test(symbol)) return 'option';   // OCC standard
+  if (/\s+\d/.test(symbol)) return 'option';             // space + digits
+  if (/[CP]\s*\d{2}\/\d{2}/.test(symbol)) return 'option';
+  return 'stock';
+}
+
+// ── IBKR Transaction History parser ─────────────────────────
+// Handles the "Transaction History" export from IBKR Client Portal
+// Section name: "Transaction History" (NOT "Trades" — that is a different export)
+// Header row cols (index 0-based):
+//   0=Section  1=RowType  2=Date  3=Account  4=Description  5=TransactionType
+//   6=Symbol   7=Quantity 8=Price 9=PriceCurrency 10=GrossAmount 11=Commission 12=NetAmount
+//
+// Also handles the classic "Trades" Activity Statement format as a fallback.
 function parseIBKR(text) {
-  return parseCSV(text).slice(1).filter(r=>r.length>=6&&r[1]).map((r,i)=>({
-    id:'ibkr-'+Date.now()+i, date:r[0].slice(0,10), broker:'ibkr',
-    symbol:r[1], type:r[1].includes(' ')?'option':'stock',
-    action:r[2].toUpperCase().includes('BUY')?'BUY':'SELL',
-    qty:Math.abs(parseFloat(r[3])||0), price:parseFloat(r[4])||0,
-    commission:Math.abs(parseFloat(r[5])||0), pnl:null, spreadId:null
-  }));
+  const lines = parseCSVLines(text);
+  const trades = [];
+
+  // ── Detect which format this file uses ───────────────────
+  const hasTxnHistory = lines.some(r => r[0] === 'Transaction History' && r[1] === 'Header');
+  const hasTradesSection = lines.some(r => r[0] === 'Trades' && r[1] === 'Header');
+
+  if (hasTxnHistory) {
+    parseTxnHistory(lines, trades);
+  } else if (hasTradesSection) {
+    parseActivityStatement(lines, trades);
+  } else {
+    throw new Error(
+      'Unrecognised IBKR file format. Expected either:\n' +
+      '• Transaction History export (Client Portal → Accounts → Transaction History → Download)\n' +
+      '• Activity Statement export (Client Portal → Reports → Statements → Activity → CSV)'
+    );
+  }
+
+  // Post-process: calculate spread P&L and group legs
+  calcSpreadPnL(trades);
+
+  if (trades.length === 0) {
+    throw new Error('No trade rows found in file. Make sure the date range includes actual trades.');
+  }
+  return trades;
 }
+
+// ── Parser for "Transaction History" format (your actual file) ──
+// Columns after section+rowtype:
+//   Date | Account | Description | Transaction Type | Symbol | Quantity | Price |
+//   Price Currency | Gross Amount | Commission | Net Amount
+function parseTxnHistory(lines, trades) {
+  // Find header row and build column map
+  let colMap = null;
+  for (let i = 0; i < lines.length; i++) {
+    const row = lines[i];
+    if (row[0] === 'Transaction History' && row[1] === 'Header') {
+      colMap = {};
+      for (let c = 2; c < row.length; c++) {
+        colMap[row[c].trim()] = c;
+      }
+      break;
+    }
+  }
+  if (!colMap) throw new Error('Could not find Transaction History header row.');
+
+  const g = (row, name) => {
+    const idx = colMap[name];
+    return idx != null && idx < row.length ? (row[idx] || '').trim() : '';
+  };
+  const num = s => parseFloat((s || '').replace(/,/g, '')) || 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const row = lines[i];
+    if (row[0] !== 'Transaction History' || row[1] !== 'Data') continue;
+
+    const txType = g(row, 'Transaction Type');
+
+    // Only process actual trades — skip Deposit, Withdrawal, Adjustment etc.
+    if (txType !== 'Buy' && txType !== 'Sell') continue;
+
+    const symbol = g(row, 'Symbol');
+    if (!symbol || symbol === '-') continue;
+
+    const dateRaw     = g(row, 'Date');
+    const description = g(row, 'Description');
+    const qtyRaw      = g(row, 'Quantity');
+    const priceRaw    = g(row, 'Price');
+    const commRaw     = g(row, 'Commission');
+    const grossRaw    = g(row, 'Gross Amount');
+
+    const qty   = Math.abs(num(qtyRaw));
+    const price = Math.abs(num(priceRaw));
+    // Commission: IBKR stores as negative number (cost to you), take abs value
+    const comm  = Math.abs(num(commRaw));
+    const gross = num(grossRaw); // negative = you paid (buy), positive = you received (sell)
+
+    // Detect type from OCC symbol format: AAPL  260620C00150000
+    // or from Transaction Type description containing "P" or "C"
+    const type = detectType(symbol);
+
+    trades.push({
+      id: 'ibkr-' + i + '-' + Date.now(),
+      date: normaliseDate(dateRaw),
+      broker: 'ibkr',
+      symbol: symbol.trim(),
+      description: description,
+      type,
+      action: txType.toUpperCase(), // 'BUY' or 'SELL'
+      qty,
+      price,
+      commission: comm,
+      gross,       // keep gross for P&L calculation
+      pnl: null,   // calculated in calcSpreadPnL()
+      spreadId: null
+    });
+  }
+}
+
+// ── Parser for classic Activity Statement format ──────────────
+// Section = "Trades", columns include T. Price, Comm/Fee, Realized P/L etc.
+function parseActivityStatement(lines, trades) {
+  let colMap = null;
+  for (let i = 0; i < lines.length; i++) {
+    const row = lines[i];
+    if (row[0] === 'Trades' && row[1] === 'Header') {
+      colMap = {};
+      for (let c = 2; c < row.length; c++) colMap[row[c].trim()] = c;
+      break;
+    }
+  }
+  if (!colMap) return;
+
+  const g = (row, name) => colMap[name] != null ? (row[colMap[name]] || '').trim() : '';
+  const num = s => parseFloat((s || '').replace(/,/g, '')) || 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const row = lines[i];
+    if (row[0] !== 'Trades' || row[1] !== 'Data') continue;
+    const disc = g(row, 'DataDiscriminator');
+    if (disc === 'SubTotal' || disc === 'Total') continue;
+
+    const symbol = g(row, 'Symbol');
+    if (!symbol) continue;
+
+    const qty    = num(g(row, 'Quantity'));
+    const price  = Math.abs(num(g(row, 'T. Price')));
+    const comm   = Math.abs(num(g(row, 'Comm/Fee')));
+    const realPL = g(row, 'Realized P/L');
+    const pnl    = realPL !== '' ? num(realPL) : null;
+    const type   = (() => {
+      const ac = g(row, 'Asset Category').toLowerCase();
+      if (ac.includes('option')) return 'option';
+      if (ac.includes('future')) return 'future';
+      return detectType(symbol);
+    })();
+
+    trades.push({
+      id: 'ibkr-' + i + '-' + Date.now(),
+      date: normaliseDate(g(row, 'Date/Time')),
+      broker: 'ibkr',
+      symbol,
+      type,
+      action: qty < 0 ? 'SELL' : 'BUY',
+      qty: Math.abs(qty),
+      price,
+      commission: comm,
+      gross: null,
+      pnl: (pnl !== null && !isNaN(pnl)) ? pnl : null,
+      spreadId: null
+    });
+  }
+}
+
+// ── Calculate spread P&L from matched legs ────────────────────
+// IBKR Transaction History has no Realized P/L column.
+// We calculate it by matching opening BUY and closing SELL legs
+// of the same symbol. For options spreads, we also group the legs.
+function calcSpreadPnL(trades) {
+  // Step 1: Group option legs on same date with same underlying → spreadId
+  const optTrades = trades.filter(t => t.type === 'option');
+  const byDateUnderlying = {};
+  optTrades.forEach(t => {
+    // Extract underlying: first non-space, non-digit chars of OCC symbol
+    // e.g. "CEG   260821P00200000" → "CEG"
+    const underlying = t.symbol.replace(/\s+.*$/, '').replace(/\d.*$/, '').trim() || t.symbol;
+    const key = t.date + '|' + underlying;
+    if (!byDateUnderlying[key]) byDateUnderlying[key] = [];
+    byDateUnderlying[key].push(t);
+  });
+  Object.entries(byDateUnderlying).forEach(([key, legs]) => {
+    if (legs.length >= 2) {
+      const spreadId = 'spread-' + key.replace('|', '-');
+      legs.forEach(t => { t.spreadId = spreadId; });
+    }
+  });
+
+  // Step 2: Calculate P&L for completed spread pairs on same date
+  // Net P&L of a spread = sum of all Gross Amounts of its legs - total commissions
+  // (Gross = what you received or paid before commission)
+  const spreadGroups = {};
+  trades.forEach(t => {
+    if (!t.spreadId) return;
+    if (!spreadGroups[t.spreadId]) spreadGroups[t.spreadId] = [];
+    spreadGroups[t.spreadId].push(t);
+  });
+
+  Object.entries(spreadGroups).forEach(([sid, legs]) => {
+    // Only calculate if we have both a buy and a sell leg
+    const hasBuy  = legs.some(l => l.action === 'BUY');
+    const hasSell = legs.some(l => l.action === 'SELL');
+    if (!hasBuy || !hasSell) return;
+
+    // Net = sum of gross amounts minus total commissions.
+    // IBKR's Gross Amount is already in dollars (price × qty × 100 for options).
+    // Do NOT multiply by 100 again.
+    const totalGross = legs.reduce((s, l) => s + (l.gross || 0), 0);
+    const totalComm  = legs.reduce((s, l) => s + l.commission, 0);
+    const netPnL     = totalGross - totalComm;
+
+    // Assign P&L to the last leg (the closing leg by date/time)
+    // Mark opening legs as null so only one row shows the P&L
+    const sortedLegs = [...legs].sort((a, b) => a.date.localeCompare(b.date));
+    const lastLeg = sortedLegs[sortedLegs.length - 1];
+    legs.forEach(l => {
+      l.pnl = (l === lastLeg) ? Math.round(netPnL * 100) / 100 : null;
+    });
+  });
+}
+
+// ── Fidelity Activity CSV parser ──────────────────────────────
+// Real Fidelity header (confirmed):
+// Run Date,Action,Symbol,Description,Type,Quantity,Price ($),Commission ($),
+// Fees ($),Accrued Interest ($),Amount ($),Cash Balance ($),Settlement Date
+//
+// Index:  0=RunDate 1=Action 2=Symbol 3=Description 4=Type
+//         5=Quantity 6=Price 7=Commission 8=Fees 9=AccruedInterest
+//         10=Amount 11=CashBalance 12=SettlementDate
 function parseFidelity(text) {
-  return parseCSV(text).slice(1).filter(r=>r.length>=7&&r[2]).map((r,i)=>({
-    id:'fid-'+Date.now()+i, date:r[0].slice(0,10), broker:'fidelity',
-    symbol:r[2], type:r[2].includes(' ')?'option':'stock',
-    action:r[1].toLowerCase().includes('buy')?'BUY':'SELL',
-    qty:Math.abs(parseFloat(r[4])||0), price:parseFloat(r[5])||0,
-    commission:Math.abs(parseFloat(r[7])||0), pnl:null, spreadId:null
-  }));
+  const lines = parseCSVLines(text);
+  const trades = [];
+
+  // Find header row — Fidelity sometimes prepends account info rows before the header
+  let headerIdx = -1;
+  for (let i = 0; i < Math.min(lines.length, 10); i++) {
+    if (lines[i][0] && lines[i][0].toLowerCase().includes('run date')) {
+      headerIdx = i; break;
+    }
+  }
+  if (headerIdx === -1) headerIdx = 0; // fallback: assume first row is header
+
+  // Build dynamic column map from header
+  const headerRow = lines[headerIdx];
+  const colMap = {};
+  headerRow.forEach((h, idx) => {
+    // Normalise: strip ($), lowercase, trim
+    const key = h.replace(/\(\$\)/g,'').replace(/[^a-z0-9 ]/gi,' ').trim().toLowerCase();
+    colMap[key] = idx;
+  });
+
+  const get = (row, name) => {
+    const idx = colMap[name];
+    return idx != null && idx < row.length ? row[idx].trim() : '';
+  };
+
+  for (let i = headerIdx + 1; i < lines.length; i++) {
+    const row = lines[i];
+    if (!row || row.length < 5) continue;
+
+    const dateRaw = get(row, 'run date');
+    const action  = get(row, 'action');
+    const symbol  = get(row, 'symbol');
+    const desc    = get(row, 'description');
+    const qtyRaw  = get(row, 'quantity');
+    const priceRaw= get(row, 'price');
+    const commRaw = get(row, 'commission');
+    const feesRaw = get(row, 'fees');
+
+    if (!symbol && !desc) continue;  // skip blank rows
+    if (!action) continue;           // skip non-trade rows (dividends, etc. unless action present)
+
+    const actionLow = action.toLowerCase();
+    // Only process buy/sell transactions (skip DIVIDEND, INTEREST, REINVEST, etc.)
+    const isBuy  = actionLow.includes('buy') || actionLow.includes('bought') || actionLow.includes('purchase');
+    const isSell = actionLow.includes('sell') || actionLow.includes('sold');
+    if (!isBuy && !isSell) continue;
+
+    const qty    = Math.abs(parseFloat(qtyRaw.replace(/,/g,''))  || 0);
+    const price  = Math.abs(parseFloat(priceRaw.replace(/[$,]/g,'')) || 0);
+    const comm   = Math.abs(parseFloat(commRaw.replace(/[$,]/g,'')) || 0);
+    const fees   = Math.abs(parseFloat(feesRaw.replace(/[$,]/g,'')) || 0);
+    const totalComm = comm + fees;
+
+    // Symbol: Fidelity sometimes puts option description in Description when Symbol is blank
+    const sym = symbol || desc.split(' ')[0];
+    const type = detectType(sym) || (desc.toLowerCase().includes('call')||desc.toLowerCase().includes('put') ? 'option' : 'stock');
+
+    trades.push({
+      id: 'fid-' + i + '-' + Date.now(),
+      date: normaliseDate(dateRaw),
+      broker: 'fidelity',
+      symbol: sym,
+      type,
+      action: isBuy ? 'BUY' : 'SELL',
+      qty,
+      price,
+      commission: totalComm,
+      pnl: null,   // Fidelity CSV doesn't include realized P/L per trade
+      spreadId: null
+    });
+  }
+
+  if (trades.length === 0) {
+    throw new Error('No buy/sell trades found. Make sure you exported from Accounts → Activity & Orders and the date range contains trades.');
+  }
+  return trades;
 }
+
+// ── Robinhood parser ──────────────────────────────────────────
+// Header: Activity Date, Instrument, Description, Trans Code, Quantity, Price, Amount
 function parseRH(text) {
-  return parseCSV(text).slice(1).filter(r=>r.length>=6&&r[1]).map((r,i)=>({
-    id:'rh-'+Date.now()+i, date:r[0].slice(0,10), broker:'rh',
-    symbol:r[1], type:r[1].includes(' ')?'option':'stock',
-    action:r[3].toUpperCase().includes('BUY')||r[2].toLowerCase().includes('bought')?'BUY':'SELL',
-    qty:Math.abs(parseFloat(r[4])||0), price:parseFloat(r[5])||0,
-    commission:0, pnl:null, spreadId:null
-  }));
+  const lines = parseCSVLines(text);
+  const trades = [];
+  // Find header
+  let hi = lines.findIndex(r => r[0] && r[0].toLowerCase().includes('activity date'));
+  if (hi === -1) hi = 0;
+  const hdr = lines[hi];
+  const col = {};
+  hdr.forEach((h,i) => { col[h.toLowerCase().trim()] = i; });
+  const g = (row, k) => { const i = col[k]; return i!=null ? (row[i]||'').trim() : ''; };
+
+  for (let i = hi+1; i < lines.length; i++) {
+    const row = lines[i];
+    if (row.length < 4) continue;
+    const code = g(row,'trans code');
+    const desc = g(row,'description').toLowerCase();
+    const isBuy  = code==='Buy'  || desc.includes('bought') || desc.includes('buy');
+    const isSell = code==='Sell' || desc.includes('sold')   || desc.includes('sell');
+    if (!isBuy && !isSell) continue;
+    const sym  = g(row,'instrument');
+    if (!sym) continue;
+    trades.push({
+      id:'rh-'+i+'-'+Date.now(), date:normaliseDate(g(row,'activity date')),
+      broker:'rh', symbol:sym, type:detectType(sym),
+      action:isBuy?'BUY':'SELL',
+      qty:Math.abs(parseFloat(g(row,'quantity').replace(/,/g,''))||0),
+      price:Math.abs(parseFloat(g(row,'price').replace(/[$,]/g,''))||0),
+      commission:0, pnl:null, spreadId:null
+    });
+  }
+  if (!trades.length) throw new Error('No trades found in Robinhood CSV.');
+  return trades;
 }
+
+// ── Schwab parser ─────────────────────────────────────────────
+// Header: Date, Action, Symbol, Description, Quantity, Price, Fees & Comm, Amount
 function parseSchwab(text) {
-  return parseCSV(text).slice(1).filter(r=>r.length>=6&&r[2]).map((r,i)=>({
-    id:'sch-'+Date.now()+i, date:r[0].slice(0,10), broker:'schwab',
-    symbol:r[2], type:r[2].includes(' ')?'option':'stock',
-    action:r[1].toLowerCase().includes('buy')?'BUY':'SELL',
-    qty:Math.abs(parseFloat(r[4])||0), price:parseFloat(r[5])||0,
-    commission:Math.abs(parseFloat(r[6])||0), pnl:null, spreadId:null
-  }));
+  const lines = parseCSVLines(text);
+  const trades = [];
+  let hi = lines.findIndex(r => r[0] && r[0].toLowerCase().includes('date'));
+  if (hi === -1) hi = 0;
+  const hdr = lines[hi];
+  const col = {};
+  hdr.forEach((h,i) => { col[h.toLowerCase().replace(/[^a-z0-9 ]/g,' ').trim()] = i; });
+  const g = (row, k) => { const i = col[k]; return i!=null ? (row[i]||'').trim() : ''; };
+
+  for (let i = hi+1; i < lines.length; i++) {
+    const row = lines[i];
+    if (row.length < 4) continue;
+    const action = g(row,'action');
+    const aLow = action.toLowerCase();
+    const isBuy  = aLow.includes('buy');
+    const isSell = aLow.includes('sell');
+    if (!isBuy && !isSell) continue;
+    const sym = g(row,'symbol');
+    if (!sym) continue;
+    const comm = Math.abs(parseFloat((g(row,'fees   comm')||g(row,'fees comm')||'0').replace(/[$,]/g,''))||0);
+    trades.push({
+      id:'sch-'+i+'-'+Date.now(), date:normaliseDate(g(row,'date')),
+      broker:'schwab', symbol:sym, type:detectType(sym),
+      action:isBuy?'BUY':'SELL',
+      qty:Math.abs(parseFloat(g(row,'quantity').replace(/,/g,''))||0),
+      price:Math.abs(parseFloat(g(row,'price').replace(/[$,]/g,''))||0),
+      commission:comm, pnl:null, spreadId:null
+    });
+  }
+  if (!trades.length) throw new Error('No trades found in Schwab CSV.');
+  return trades;
 }
+
 const PARSERS = { ibkr:parseIBKR, fidelity:parseFidelity, rh:parseRH, schwab:parseSchwab };
 
 function handleFile(e, broker) {
   const file = e.target.files[0]; if (!file) return;
   const reader = new FileReader();
   reader.onload = async ev => {
-    const newTrades = PARSERS[broker](ev.target.result);
-    state.trades = state.trades.filter(t => t.broker !== broker).concat(newTrades);
-    setSyncStatus('loading', '↺ saving to Sheets…');
-    await pushTrades();
-    showPage('activity');
+    try {
+      const newTrades = PARSERS[broker](ev.target.result);
+      state.trades = state.trades.filter(t => t.broker !== broker).concat(newTrades);
+      setSyncStatus('loading', '↺ saving to Sheets…');
+      await pushTrades();
+      alert('✓ Imported ' + newTrades.length + ' trades from ' + BROKERS[broker] + '.');
+      showPage('activity');
+    } catch(err) {
+      alert('Import failed for ' + BROKERS[broker] + ':\n\n' + err.message + '\n\nCheck the export instructions in the Import tab.');
+      setSyncStatus('err', '✗ import failed');
+    }
   };
   reader.readAsText(file);
   e.target.value = '';
@@ -435,7 +832,7 @@ function renderImport() {
   const counts = {};
   state.trades.forEach(t=>{ if(t.type!=='spread') counts[t.broker]=(counts[t.broker]||0)+1; });
   const hints = { ibkr:'Flex Report or Activity Statement CSV', fidelity:'Account activity CSV export', rh:'Stock / option history CSV', schwab:'Transaction history CSV' };
-  const exportSteps = { ibkr:'Reports → Activity → Trade History → Download CSV', fidelity:'Accounts → Activity & Orders → Export to CSV', rh:'Account → Statements & History → Download CSV', schwab:'Accounts → History → Export → CSV' };
+  const exportSteps = { ibkr:'Client Portal → Performance & Reports → Statements → Activity → Format: CSV → Download. The file has multiple sections; the parser auto-finds the Trades section.', fidelity:'Accounts → Activity & Orders → select date range → Export to CSV. Header row must start with Run Date.', rh:'Account → Statements & History → Download CSV (stock or option history).', schwab:'Accounts → History → Export → Download CSV (select date range first).' };
   return `
   ${connectionBanner()}
   <p style="color:var(--muted);font-size:12px;margin-bottom:16px">Upload CSV exports — they are parsed in your browser and saved to your Google Sheet automatically.</p>
