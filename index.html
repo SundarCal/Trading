@@ -828,6 +828,23 @@ function renderPositions() {
 }
 
 // ── Import CSV page ───────────────────────────────────────────
+function clearBroker(broker) {
+  if (!confirm('Clear all ' + BROKERS[broker] + ' trades? This cannot be undone.')) return;
+  state.trades = state.trades.filter(t => t.broker !== broker);
+  if (state.scriptUrl) pushTrades();
+  render();
+}
+
+async function clearAllTrades() {
+  if (!confirm('Clear ALL trades from ALL brokers? This cannot be undone.')) return;
+  state.trades = [];
+  if (state.scriptUrl) {
+    setSyncStatus('loading', '↺ clearing…');
+    await pushTrades();
+  }
+  render();
+}
+
 function renderImport() {
   const counts = {};
   state.trades.forEach(t=>{ if(t.type!=='spread') counts[t.broker]=(counts[t.broker]||0)+1; });
@@ -843,7 +860,7 @@ function renderImport() {
       <div class="upload-icon">📤</div>
       <div class="upload-broker" style="color:${COLORS[k]}">${v}</div>
       <div class="upload-hint">${hints[k]}</div>
-      ${counts[k]?`<div class="upload-count">✓ ${counts[k]} trades</div>`:''}
+      ${counts[k]?`<div class="upload-count">✓ ${counts[k]} trades &nbsp;<button class="btn btn-red" style="font-size:10px;padding:2px 8px;height:auto;margin-left:6px" onclick="event.stopPropagation();clearBroker('${k}')">✕ clear</button></div>`:''}
     </div>`).join('')}
   </div>
   <div style="margin-bottom:14px">
@@ -857,6 +874,7 @@ function renderImport() {
       </div>`).join('')}
     </div>
     <button class="btn btn-green" onclick="pushAll()">↑ Save balances to Sheets</button>
+    <button class="btn btn-red" style="margin-left:8px" onclick="clearAllTrades()">✕ Clear all trades</button>
   </div>
   <div class="info-box">
     <h3>How to export CSV from each broker</h3>
