@@ -110,6 +110,28 @@
   .cash-row input { background: var(--bg3); border: 1px solid var(--border); color: var(--text); font-family: inherit; font-size: 13px; padding: 5px 8px; border-radius: var(--radius); flex: 1; outline: none; }
   .cash-row input:focus { border-color: var(--blue); }
   @media (max-width: 600px) { .import-grid { grid-template-columns: 1fr; } .topbar { flex-wrap: wrap; } }
+
+  /* Spreads page */
+  .spread-card { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 12px; overflow: hidden; }
+  .spread-header { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  .spread-symbol { font-size: 14px; font-weight: 700; letter-spacing: -0.3px; }
+  .spread-expiry { font-size: 11px; color: var(--muted); background: var(--bg3); border-radius: 4px; padding: 2px 7px; }
+  .spread-type-pill { font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 4px; }
+  .spread-put  { background: #2d1b4e; color: #c084fc; }
+  .spread-call { background: #1b2d4e; color: #60a5fa; }
+  .spread-meta { display: flex; gap: 20px; padding: 12px 16px; flex-wrap: wrap; border-bottom: 1px solid var(--border); }
+  .spread-meta-item { display: flex; flex-direction: column; gap: 3px; }
+  .spread-meta-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px; }
+  .spread-meta-val { font-size: 13px; font-weight: 600; }
+  .spread-legs { padding: 0; }
+  .spread-leg { display: grid; grid-template-columns: 80px 1fr 80px 80px 90px 90px 100px; gap: 8px; align-items: center; padding: 10px 16px; border-bottom: 1px solid var(--border); font-size: 12px; }
+  .spread-leg:last-child { border-bottom: none; }
+  .spread-leg-header { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px; background: var(--bg3); }
+  .spread-pnl-banner { display: flex; align-items: center; justify-content: space-between; padding: 10px 16px; background: var(--bg3); font-size: 13px; }
+  .spread-filters { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; align-items: center; }
+  .status-open   { font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 4px; background: #0d2a0d; color: var(--green); }
+  .status-closed { font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 4px; background: var(--bg3); color: var(--muted); }
+  .status-expired{ font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 4px; background: #2d1b00; color: var(--orange); }
 </style>
 </head>
 <body>
@@ -121,6 +143,7 @@
     <button class="btn btn-blue" onclick="syncNow()" id="sync-btn" style="font-size:11px">↺ Sync</button>
     <div class="nav">
       <button class="nav-btn active" onclick="showPage('activity')">Activity</button>
+      <button class="nav-btn" onclick="showPage('spreads')">Spreads</button>
       <button class="nav-btn" onclick="showPage('positions')">Positions</button>
       <button class="nav-btn" onclick="showPage('import')">Import CSV</button>
       <button class="nav-btn" onclick="showPage('setup')">⚙ Setup</button>
@@ -777,6 +800,267 @@ function renderActivity() {
   }).join('')}`;
 }
 
+// ── Spreads page ─────────────────────────────────────────────
+// Parses OCC symbol like "CEG   260821P00200000"
+// → { underlying:'CEG', expiry:'2026-08-21', strike:200, type:'P' }
+function parseOCC(symbol) {
+  if (!symbol) return null;
+  // OCC format: UUUUUU YYMMDD C/P XXXXXXXX  (spaces variable)
+  const m = symbol.trim().match(/^([A-Z]+)\s+(\d{2})(\d{2})(\d{2})([CP])(\d{8})$/);
+  if (!m) return null;
+  const [,under, yy, mm, dd, cp, strikePad] = m;
+  const strike = parseInt(strikePad, 10) / 1000;
+  const expiry = '20'+yy+'-'+mm+'-'+dd;
+  return { underlying: under.trim(), expiry, strike, optType: cp };
+}
+
+function fmtExpiry(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso + 'T12:00:00');
+  return d.toLocaleDateString('en-US', { month:'short', day:'numeric', year:'numeric' });
+}
+
+// Build spread summary objects from raw trades
+function buildSpreads(trades) {
+  // Group by spreadId
+  const groups = {};
+  trades.forEach(t => {
+    if (!t.spreadId) return;
+    if (!groups[t.spreadId]) groups[t.spreadId] = [];
+    groups[t.spreadId].push(t);
+  });
+
+  const spreads = [];
+  Object.entries(groups).forEach(([sid, legs]) => {
+    if (!legs.length) return;
+
+    // Sort legs: sells first (short leg), buys second (long leg)
+    const sells = legs.filter(l => l.action === 'SELL');
+    const buys  = legs.filter(l => l.action === 'BUY');
+
+    // Parse OCC symbols for each leg
+    const parsedLegs = legs.map(l => ({
+      ...l,
+      occ: parseOCC(l.symbol)
+    }));
+
+    // Get underlying from first leg that parses
+    const firstParsed = parsedLegs.find(l => l.occ);
+    const underlying  = firstParsed ? firstParsed.occ.underlying : legs[0].symbol.split(/\s+/)[0];
+
+    // Expiry — all legs of a spread share same expiry
+    const expiry = firstParsed ? firstParsed.occ.expiry : null;
+
+    // Option type: P = put spread, C = call spread
+    const optType = firstParsed ? firstParsed.occ.optType : '?';
+
+    // Opening date = earliest date among legs
+    const openDate = legs.map(l => l.date).sort()[0];
+
+    // Closing date = latest date among legs (for closed spreads)
+    const closeDate = legs.map(l => l.date).sort().reverse()[0];
+
+    // Status: if expiry is in the past and no close date after open, mark expired
+    const today = new Date().toISOString().slice(0,10);
+    const isExpired = expiry && expiry < today && openDate === closeDate;
+    const isClosed  = sells.length > 0 && buys.length > 0 && openDate !== closeDate;
+    const status    = isClosed ? 'closed' : (isExpired ? 'expired' : 'open');
+
+    // Short leg = the SELL (premium collected)
+    // Long leg  = the BUY (protection bought)
+    // For a put credit spread: SELL higher strike, BUY lower strike
+    const shortLeg = sells[0];
+    const longLeg  = buys[0];
+
+    const shortOCC = shortLeg ? parseOCC(shortLeg.symbol) : null;
+    const longOCC  = longLeg  ? parseOCC(longLeg.symbol)  : null;
+
+    // Net credit = premium collected (sell) - premium paid (buy)
+    const premiumCollected = sells.reduce((s,l) => s + (l.price * l.qty * 100), 0);
+    const premiumPaid      = buys.reduce((s,l)  => s + (l.price * l.qty * 100), 0);
+    const netCredit        = premiumCollected - premiumPaid;
+
+    // Max profit = net credit (if spread expires worthless)
+    // Max loss   = (strike width - net credit) × 100 × qty
+    const strikeWidth = (shortOCC && longOCC)
+      ? Math.abs(shortOCC.strike - longOCC.strike)
+      : null;
+    const qty = shortLeg ? shortLeg.qty : 1;
+    const maxLoss = strikeWidth ? (strikeWidth - netCredit/100) * 100 * qty : null;
+
+    // Realized P&L (from calcSpreadPnL)
+    const realizedPnl = legs.find(l => l.pnl != null)?.pnl ?? null;
+
+    // Total commission
+    const totalComm = legs.reduce((s,l) => s + Number(l.commission), 0);
+
+    spreads.push({
+      id: sid,
+      broker: legs[0].broker,
+      underlying,
+      expiry,
+      optType,
+      status,
+      openDate,
+      closeDate: openDate !== closeDate ? closeDate : null,
+      legs: parsedLegs,
+      shortLeg, longLeg, shortOCC, longOCC,
+      premiumCollected, premiumPaid, netCredit,
+      strikeWidth, maxLoss, qty,
+      realizedPnl, totalComm
+    });
+  });
+
+  // Sort by openDate descending
+  return spreads.sort((a,b) => b.openDate.localeCompare(a.openDate));
+}
+
+function renderSpreads() {
+  const trades  = state.acct === 'all'
+    ? state.trades
+    : state.trades.filter(t => t.broker === state.acct);
+
+  const spreads = buildSpreads(trades);
+
+  // Filter controls
+  const statusFilter = window._spreadStatus || 'all';
+  const symFilter    = window._spreadSym    || '';
+
+  const filtered = spreads.filter(s => {
+    if (statusFilter !== 'all' && s.status !== statusFilter) return false;
+    if (symFilter && !s.underlying.toLowerCase().includes(symFilter.toLowerCase())) return false;
+    return true;
+  });
+
+  // Summary metrics
+  const totalPnl    = filtered.filter(s=>s.realizedPnl!=null).reduce((a,s)=>a+s.realizedPnl,0);
+  const totalComm   = filtered.reduce((a,s)=>a+s.totalComm,0);
+  const winners     = filtered.filter(s=>s.realizedPnl!=null&&s.realizedPnl>0).length;
+  const withPnl     = filtered.filter(s=>s.realizedPnl!=null).length;
+  const winRate     = withPnl ? Math.round(winners/withPnl*100) : 0;
+  const totalCredit = filtered.reduce((a,s)=>a+s.netCredit,0);
+
+  const statusBadge = s => {
+    if (s.status==='closed')  return '<span class="status-closed">CLOSED</span>';
+    if (s.status==='expired') return '<span class="status-expired">EXPIRED</span>';
+    return '<span class="status-open">OPEN</span>';
+  };
+
+  const spreadTypePill = s =>
+    `<span class="spread-type-pill ${s.optType==='P'?'spread-put':'spread-call'}">${s.optType==='P'?'PUT SPREAD':'CALL SPREAD'}</span>`;
+
+  const legRow = (l, occ) => {
+    const strike = occ ? '$'+occ.strike.toFixed(2) : '—';
+    return `
+    <div class="spread-leg">
+      <span>${badge(l.action)}</span>
+      <span style="font-weight:600">${l.symbol.trim()}</span>
+      <span style="text-align:right">${strike}</span>
+      <span style="text-align:right">${l.qty}</span>
+      <span style="text-align:right">${fmt(l.price)}</span>
+      <span style="text-align:right;color:var(--muted)">-${fmt(l.commission)}</span>
+      <span style="text-align:right;color:var(--muted)">${fmtDate(l.date)}</span>
+    </div>`;
+  };
+
+  const spreadCard = s => `
+  <div class="spread-card">
+    <div class="spread-header">
+      <span class="spread-symbol">${s.underlying}</span>
+      ${spreadTypePill(s)}
+      <span class="spread-expiry">Exp: ${fmtExpiry(s.expiry)}</span>
+      ${statusBadge(s)}
+      <span class="chip chip-${s.broker}" style="margin-left:auto">${BROKERS[s.broker]}</span>
+    </div>
+
+    <div class="spread-meta">
+      <div class="spread-meta-item">
+        <span class="spread-meta-label">Short leg (sell)</span>
+        <span class="spread-meta-val">${s.shortOCC ? '$'+s.shortOCC.strike.toFixed(0)+' '+s.optType : '—'}</span>
+      </div>
+      <div class="spread-meta-item">
+        <span class="spread-meta-label">Long leg (buy)</span>
+        <span class="spread-meta-val">${s.longOCC ? '$'+s.longOCC.strike.toFixed(0)+' '+s.optType : '—'}</span>
+      </div>
+      <div class="spread-meta-item">
+        <span class="spread-meta-label">Strike width</span>
+        <span class="spread-meta-val">${s.strikeWidth ? '$'+s.strikeWidth.toFixed(0) : '—'}</span>
+      </div>
+      <div class="spread-meta-item">
+        <span class="spread-meta-label">Qty (contracts)</span>
+        <span class="spread-meta-val">${s.qty}</span>
+      </div>
+      <div class="spread-meta-item">
+        <span class="spread-meta-label">Net credit collected</span>
+        <span class="spread-meta-val ${s.netCredit>=0?'pos':'neg'}">${fmtSign(s.netCredit)}</span>
+      </div>
+      <div class="spread-meta-item">
+        <span class="spread-meta-label">Max profit</span>
+        <span class="spread-meta-val pos">${fmtSign(s.netCredit)}</span>
+      </div>
+      <div class="spread-meta-item">
+        <span class="spread-meta-label">Max loss</span>
+        <span class="spread-meta-val neg">${s.maxLoss!=null?fmtSign(-s.maxLoss):'—'}</span>
+      </div>
+      <div class="spread-meta-item">
+        <span class="spread-meta-label">Opened</span>
+        <span class="spread-meta-val">${fmtDate(s.openDate)}</span>
+      </div>
+      ${s.closeDate ? `<div class="spread-meta-item">
+        <span class="spread-meta-label">Closed</span>
+        <span class="spread-meta-val">${fmtDate(s.closeDate)}</span>
+      </div>` : ''}
+      <div class="spread-meta-item">
+        <span class="spread-meta-label">Commissions</span>
+        <span class="spread-meta-val neg">-${fmt(s.totalComm)}</span>
+      </div>
+      <div class="spread-meta-item">
+        <span class="spread-meta-label">Realized P&amp;L</span>
+        <span class="spread-meta-val ${s.realizedPnl!=null?(s.realizedPnl>=0?'pos':'neg'):''}">${s.realizedPnl!=null?fmtSign(s.realizedPnl):'Pending'}</span>
+      </div>
+    </div>
+
+    <div class="spread-legs">
+      <div class="spread-leg spread-leg-header">
+        <span>Action</span><span>Symbol</span><span style="text-align:right">Strike</span>
+        <span style="text-align:right">Qty</span><span style="text-align:right">Price</span>
+        <span style="text-align:right">Commission</span><span style="text-align:right">Date</span>
+      </div>
+      ${s.legs.map(l => legRow(l, l.occ)).join('')}
+    </div>
+
+    <div class="spread-pnl-banner">
+      <span style="color:var(--muted);font-size:12px">Net P&amp;L after commissions</span>
+      <span style="font-size:16px;font-weight:700" class="${s.realizedPnl!=null?(s.realizedPnl>=0?'pos':'neg'):''}">${s.realizedPnl!=null?fmtSign(s.realizedPnl):'Open / Pending'}</span>
+    </div>
+  </div>`;
+
+  return `
+  ${acctTabsHTML()}
+  <div class="metrics">
+    <div class="metric"><div class="metric-label">Total Spreads</div><div class="metric-val">${filtered.length}</div></div>
+    <div class="metric"><div class="metric-label">Realized P&amp;L</div><div class="metric-val ${totalPnl>=0?'green':'red'}">${fmtSign(totalPnl)}</div></div>
+    <div class="metric"><div class="metric-label">Net Credit</div><div class="metric-val blue">${fmtSign(totalCredit)}</div></div>
+    <div class="metric"><div class="metric-label">Win Rate</div><div class="metric-val ${winRate>=50?'green':'red'}">${winRate}%</div></div>
+    <div class="metric"><div class="metric-label">Commissions</div><div class="metric-val red">-${fmt(totalComm)}</div></div>
+  </div>
+
+  <div class="spread-filters">
+    <button class="btn ${statusFilter==='all'?'btn-blue':''}" onclick="window._spreadStatus='all';render()">All</button>
+    <button class="btn ${statusFilter==='open'?'btn-blue':''}" onclick="window._spreadStatus='open';render()">Open</button>
+    <button class="btn ${statusFilter==='closed'?'btn-blue':''}" onclick="window._spreadStatus='closed';render()">Closed</button>
+    <button class="btn ${statusFilter==='expired'?'btn-blue':''}" onclick="window._spreadStatus='expired';render()">Expired</button>
+    <input type="text" placeholder="Filter symbol..." value="${symFilter}"
+      oninput="window._spreadSym=this.value;render()"
+      style="background:var(--bg2);border:1px solid var(--border);color:var(--text);font-family:inherit;font-size:12px;padding:6px 10px;border-radius:var(--radius);height:32px;outline:none;max-width:180px"/>
+  </div>
+
+  ${filtered.length===0
+    ? '<div class="empty"><div class="empty-icon">📋</div>No spreads found. Import your IBKR CSV to see your spreads here.</div>'
+    : filtered.map(spreadCard).join('')
+  }`;
+}
+
 // ── Positions page ────────────────────────────────────────────
 function renderPositions() {
   const pos = filteredPositions();
@@ -956,7 +1240,7 @@ function renderSetup() {
 // ── Navigation ────────────────────────────────────────────────
 function showPage(p) {
   state.page = p;
-  document.querySelectorAll('.nav-btn').forEach((b,i) => b.classList.toggle('active', ['activity','positions','import','setup'][i]===p));
+  document.querySelectorAll('.nav-btn').forEach((b,i) => b.classList.toggle('active', ['activity','spreads','positions','import','setup'][i]===p));
   render();
 }
 function setAcct(a) { state.acct = a; render(); }
@@ -964,6 +1248,7 @@ function setAcct(a) { state.acct = a; render(); }
 function render() {
   const el = document.getElementById('content');
   if (state.page==='activity')  el.innerHTML = renderActivity();
+  else if (state.page==='spreads')   el.innerHTML = renderSpreads();
   else if (state.page==='positions') el.innerHTML = renderPositions();
   else if (state.page==='import')    el.innerHTML = renderImport();
   else el.innerHTML = renderSetup();
