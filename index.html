@@ -802,60 +802,43 @@ function renderActivity() {
 
 // ── Spreads page ─────────────────────────────────────────────
 
-// Parse OCC option symbol: "CEG   260821P00200000"
 function parseOCC(symbol) {
   if (!symbol) return null;
   const m = symbol.trim().match(/^([A-Z]+)\s+(\d{2})(\d{2})(\d{2})([CP])(\d{8})$/);
   if (!m) return null;
   const [, under, yy, mm, dd, cp, strikePad] = m;
-  return {
-    underlying: under.trim(),
-    expiry: '20' + yy + '-' + mm + '-' + dd,
-    strike: parseInt(strikePad, 10) / 1000,
-    optType: cp
-  };
+  return { underlying: under.trim(), expiry: '20'+yy+'-'+mm+'-'+dd,
+           strike: parseInt(strikePad, 10) / 1000, optType: cp };
 }
 
-// Safe date formatter — always append T12:00:00 to avoid UTC rollback
+// Always append T12:00:00 so local timezone never rolls the date back
 function fmtD(iso) {
   if (!iso) return '—';
-  const d = new Date(iso.slice(0,10) + 'T12:00:00');
-  if (isNaN(d)) return iso; // fallback: show raw string
-  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  const s = String(iso).slice(0, 10);
+  const d = new Date(s + 'T12:00:00');
+  return isNaN(d) ? s : d.toLocaleDateString('en-US', { month:'short', day:'numeric', year:'numeric' });
 }
-
 function fmtDShort(iso) {
   if (!iso) return '—';
-  const d = new Date(iso.slice(0,10) + 'T12:00:00');
-  if (isNaN(d)) return iso;
-  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  const s = String(iso).slice(0, 10);
+  const d = new Date(s + 'T12:00:00');
+  return isNaN(d) ? s : d.toLocaleDateString('en-US', { month:'short', day:'numeric' });
 }
-
 function daysBetween(d1, d2) {
-  if (!d1 || !d2) return 0;
-  return Math.max(1, Math.round((new Date(d2+'T12:00:00') - new Date(d1+'T12:00:00')) / 86400000));
+  if (!d1 || !d2) return 1;
+  const diff = Math.round((new Date(String(d2).slice(0,10)+'T12:00:00') -
+                           new Date(String(d1).slice(0,10)+'T12:00:00')) / 86400000);
+  return Math.max(1, diff);
 }
-
-// ── Core spread builder ───────────────────────────────────────
-// Strategy: group trades by OCC symbol, then pair BUY+SELL of same symbol.
-// A spread = one short leg (sell to open) + one long leg (buy to open),
-// optionally with closing trades (buy to close + sell to close) on a different date.
-//
-// Algorithm:
-// 1. Parse every option trade → attach OCC data
-// 2. Group by symbol
-// 3. Within each symbol group, pair SELL (open) with BUY (close) chronologically
-//    and BUY (open) with SELL (close) chronologically
-// 4. Find paired symbols (same underlying, same expiry, different strike) → spread
-// 5. Merge the two symbol pairs into one spread object
 
 function buildSpreads(trades) {
+  // 1. Keep only option trades with parseable OCC symbols
   const optTrades = trades
     .filter(t => t.type === 'option')
     .map(t => ({ ...t, occ: parseOCC(t.symbol) }))
     .filter(t => t.occ);
 
-  // Group trades by exact symbol
+  // 2. Group by exact trimmed symbol
   const bySymbol = {};
   optTrades.forEach(t => {
     const key = t.symbol.trim();
@@ -863,156 +846,115 @@ function buildSpreads(trades) {
     bySymbol[key].push(t);
   });
 
-  // For each symbol, match opening and closing trades into "legs"
-  // A leg = { symbol, occ, openDate, openPrice, openAction, closeDate, closePrice, closeAction, allTrades }
+  // 3. For each symbol, determine open/close trades
+  //    Opening trade = first trade chronologically
+  //    Closing trade = later trades with the OPPOSITE action
   const legs = [];
   Object.entries(bySymbol).forEach(([sym, symTrades]) => {
-    const sorted = [...symTrades].sort((a,b) => a.date.localeCompare(b.date));
+    const sorted     = [...symTrades].sort((a, b) => a.date.localeCompare(b.date));
+    const openDate   = sorted[0].date;
+    const openAction = sorted[0].action;              // SELL = short leg, BUY = long leg
+    const closeAction = openAction === 'SELL' ? 'BUY' : 'SELL';
 
-    // For a credit spread: first trade of a symbol is the opening leg
-    // If sold first → short leg (sell to open, buy to close)
-    // If bought first → long leg (buy to open, sell to close)
-    const sells = sorted.filter(t => t.action === 'SELL');
-    const buys  = sorted.filter(t => t.action === 'BUY');
-
-    // Pair each sell with a buy (chronological)
-    // Net qty per action — handle partial fills
-    const totalSellQty = sells.reduce((s,t)=>s+Number(t.qty),0);
-    const totalBuyQty  = buys.reduce((s,t)=>s+Number(t.qty),0);
-
-    const openSells  = sells.filter((t,i) => i === 0 || sells[0].date === t.date);
-    const closeSells = sells.filter((t,i) => sells[0].date !== t.date);
-    const openBuys   = buys.filter((t,i)  => i === 0 || buys[0].date === t.date);
-    const closeBuys  = buys.filter((t,i)  => buys[0].date !== t.date);
-
-    // Determine open action from first trade
-    const firstTrade = sorted[0];
-    const isShortLeg = firstTrade.action === 'SELL'; // sold first = short (credit)
-
-    const openTrades  = isShortLeg ? openSells  : openBuys;
-    const closeTrades = isShortLeg ? closeBuys  : closeSells;
-
-    const openDate   = openTrades.length  ? openTrades[0].date   : firstTrade.date;
-    const closeDate  = closeTrades.length ? closeTrades[0].date  : null;
-
-    const openGross  = openTrades.reduce((s,t)=>s+Number(t.gross||0),0);
-    const closeGross = closeTrades.reduce((s,t)=>s+Number(t.gross||0),0);
-    const openComm   = openTrades.reduce((s,t)=>s+Number(t.commission||0),0);
-    const closeComm  = closeTrades.reduce((s,t)=>s+Number(t.commission||0),0);
-
-    // Average open/close price weighted by qty
-    const openQty   = openTrades.reduce((s,t)=>s+Number(t.qty),0);
-    const closeQty  = closeTrades.reduce((s,t)=>s+Number(t.qty),0);
-    const openPrice = openQty  ? openTrades.reduce((s,t)=>s+Number(t.price)*Number(t.qty),0)/openQty   : 0;
-    const closePrice= closeQty ? closeTrades.reduce((s,t)=>s+Number(t.price)*Number(t.qty),0)/closeQty : 0;
+    const openTrades  = sorted.filter(t => t.date === openDate);
+    const closeTrades = sorted.filter(t => t.date !== openDate && t.action === closeAction);
+    const closeDate   = closeTrades.length ? closeTrades[0].date : null;
 
     legs.push({
-      symbol: sym, occ: firstTrade.occ,
-      isShortLeg,
-      openDate, closeDate,
-      openPrice, closePrice,
-      openQty, closeQty,
-      openGross, closeGross,
-      openComm, closeComm,
-      allTrades: sorted
+      symbol: sym,
+      occ: sorted[0].occ,
+      isShortLeg: openAction === 'SELL',
+      openDate,
+      closeDate,
+      openQty:    openTrades.reduce((s,t)  => s + Number(t.qty), 0),
+      openGross:  openTrades.reduce((s,t)  => s + Number(t.gross || 0), 0),
+      closeGross: closeTrades.reduce((s,t) => s + Number(t.gross || 0), 0),
+      openComm:   openTrades.reduce((s,t)  => s + Number(t.commission || 0), 0),
+      closeComm:  closeTrades.reduce((s,t) => s + Number(t.commission || 0), 0),
+      openPrice:  openTrades[0] ? Number(openTrades[0].price) : 0,
+      closePrice: closeTrades[0] ? Number(closeTrades[0].price) : 0,
+      allTrades:  sorted
     });
   });
 
-  // ── Pair legs into spreads ───────────────────────────────────
-  // Two legs form a spread if they share: underlying, expiry, same openDate, same qty
-  // One is short (sold first), one is long (bought first)
+  // 4. Pair legs: same underlying + expiry + openDate, opposite isShortLeg, different strike
   const spreads = [];
-  const used = new Set();
+  const used    = new Set();
 
   legs.forEach((leg, i) => {
     if (used.has(i)) return;
-    const occ = leg.occ;
+    legs.forEach((other, j) => {
+      if (j <= i || used.has(j)) return;
+      if (leg.occ.underlying !== other.occ.underlying) return;
+      if (leg.occ.expiry     !== other.occ.expiry)     return;
+      if (leg.occ.strike     === other.occ.strike)      return;
+      if (leg.openDate       !== other.openDate)         return;
+      if (leg.isShortLeg     === other.isShortLeg)       return;
 
-    // Find the paired leg
-    for (let j = i+1; j < legs.length; j++) {
-      if (used.has(j)) continue;
-      const other = legs[j];
-      const oocc  = other.occ;
-
-      // Must share underlying + expiry, same open date, different strike, opposite roles
-      if (occ.underlying !== oocc.underlying) continue;
-      if (occ.expiry !== oocc.expiry) continue;
-      if (occ.strike === oocc.strike) continue;
-      if (leg.openDate !== other.openDate) continue;
-      if (leg.isShortLeg === other.isShortLeg) continue; // must be opposite
-
-      // Found a pair
       used.add(i); used.add(j);
 
-      const shortLeg = leg.isShortLeg ? leg : other;
-      const longLeg  = leg.isShortLeg ? other : leg;
+      const sl = leg.isShortLeg ? leg : other;   // short = sold first
+      const ll = leg.isShortLeg ? other : leg;   // long  = bought first
 
-      // All 4 trades (open short, open long, close short, close long)
-      const allTrades = [...shortLeg.allTrades, ...longLeg.allTrades]
-        .sort((a,b) => a.date.localeCompare(b.date));
+      const openCredit = sl.openGross  + ll.openGross;   // net cash at open (positive = credit)
+      const closeDebit = sl.closeGross + ll.closeGross;  // net cash at close (negative = debit paid)
+      const totalGross = openCredit + closeDebit;
+      const totalComm  = sl.openComm + ll.openComm + sl.closeComm + ll.closeComm;
 
-      // Dates
-      const openDate  = shortLeg.openDate;
-      const closeDate = shortLeg.closeDate || longLeg.closeDate || null;
-      const today     = new Date().toISOString().slice(0,10);
-      const expired   = occ.expiry < today && !closeDate;
-      const status    = closeDate ? 'closed' : (expired ? 'expired' : 'open');
-      const daysHeld  = daysBetween(openDate, closeDate || today);
+      const closeDate  = sl.closeDate || ll.closeDate || null;
+      const today      = new Date().toISOString().slice(0, 10);
+      const expiry     = sl.occ.expiry;
+      const isExpired  = expiry < today && !closeDate;
+      const isClosed   = !!closeDate || isExpired;       // closed by trade OR by expiry
+      const status     = closeDate ? 'closed' : (isExpired ? 'expired' : 'open');
 
-      // P&L
-      // Net credit at open = shortLeg.openGross + longLeg.openGross
-      //   (shortLeg.openGross is positive, longLeg.openGross is negative)
-      const openCredit = shortLeg.openGross + longLeg.openGross; // net cash received
-      // Cost to close = shortLeg.closeGross + longLeg.closeGross (negative net)
-      const closeDebit = (shortLeg.closeGross || 0) + (longLeg.closeGross || 0);
-      // Total P&L = total gross inflows+outflows - total commissions
-      const totalGross = shortLeg.openGross + longLeg.openGross +
-                         (shortLeg.closeGross||0) + (longLeg.closeGross||0);
-      const totalComm  = shortLeg.openComm + longLeg.openComm +
-                         (shortLeg.closeComm||0) + (longLeg.closeComm||0);
-      const netPnL     = status === 'open' ? null : totalGross - totalComm;
+      // For P&L: expired worthless = no debit to close, full credit kept
+      const netPnL    = isClosed ? totalGross - totalComm : null;
 
-      // % return = P&L / openCredit × 100
-      const pctReturn  = (netPnL != null && openCredit > 0)
-        ? netPnL / openCredit * 100 : null;
+      // Days held: open → close date, or open → expiry date for expired, or open → today for open
+      const endDate   = closeDate || (isExpired ? expiry : today);
+      const daysHeld  = daysBetween(sl.openDate, endDate);
 
-      // Max risk = strike width × 100 × qty - openCredit
-      const strikeWidth = Math.abs(shortLeg.occ.strike - longLeg.occ.strike);
-      const qty         = shortLeg.openQty;
+      const strikeWidth = Math.abs(sl.occ.strike - ll.occ.strike);
+      const qty         = sl.openQty;
       const maxRisk     = (strikeWidth * 100 * qty) - openCredit;
 
+      // % return = P&L / credit collected at open
+      const pctReturn   = (isClosed && netPnL != null && openCredit > 0)
+        ? (netPnL / openCredit * 100) : null;
+
       // APR = (P&L / maxRisk) × (365 / daysHeld) × 100
-      const apr = (netPnL != null && maxRisk > 0 && daysHeld > 0)
+      const apr = (isClosed && netPnL != null && maxRisk > 0 && daysHeld > 0)
         ? (netPnL / maxRisk) * (365 / daysHeld) * 100 : null;
 
+      // Merge all 4 trades for the leg table
+      const allTrades = [...sl.allTrades, ...ll.allTrades]
+        .sort((a, b) => a.date.localeCompare(b.date));
+
       spreads.push({
-        id: `${occ.underlying}-${occ.expiry}-${openDate}`,
-        broker: shortLeg.allTrades[0].broker,
-        underlying: occ.underlying,
-        expiry: occ.expiry,
-        optType: occ.optType,
-        status, openDate, closeDate, daysHeld,
-        shortLeg, longLeg, allTrades,
+        id: sl.occ.underlying + '-' + expiry + '-' + sl.openDate,
+        broker: sl.allTrades[0].broker,
+        underlying: sl.occ.underlying,
+        expiry, optType: sl.occ.optType,
+        status, openDate: sl.openDate, closeDate, daysHeld,
+        sl, ll, allTrades,
         strikeWidth, qty,
         openCredit, closeDebit,
         totalGross, totalComm, maxRisk,
         netPnL, pctReturn, apr
       });
-      break;
-    }
+    });
   });
 
-  // Sort newest first
-  return spreads.sort((a,b) => b.openDate.localeCompare(a.openDate));
+  return spreads.sort((a, b) => b.openDate.localeCompare(a.openDate));
 }
 
-// ── Spread page renderer ──────────────────────────────────────
 function renderSpreads() {
   const trades  = state.acct === 'all' ? state.trades : state.trades.filter(t => t.broker === state.acct);
   const spreads = buildSpreads(trades);
 
   const statusFilter = window._spreadStatus || 'all';
-  const symFilter    = (window._spreadSym || '').toLowerCase();
+  const symFilter    = (window._spreadSym   || '').toLowerCase();
 
   const filtered = spreads.filter(s => {
     if (statusFilter !== 'all' && s.status !== statusFilter) return false;
@@ -1020,51 +962,49 @@ function renderSpreads() {
     return true;
   });
 
-  // Summary metrics
-  const closed     = filtered.filter(s => s.netPnL != null);
-  const totalPnl   = closed.reduce((a,s) => a + s.netPnL, 0);
-  const totalComm  = filtered.reduce((a,s) => a + s.totalComm, 0);
-  const winners    = closed.filter(s => s.netPnL > 0).length;
-  const winRate    = closed.length ? Math.round(winners / closed.length * 100) : 0;
-  const avgPct     = closed.filter(s=>s.pctReturn!=null).length
-    ? closed.filter(s=>s.pctReturn!=null).reduce((a,s,_,arr)=>a+s.pctReturn/arr.length,0) : 0;
-  const avgApr     = closed.filter(s=>s.apr!=null).length
-    ? closed.filter(s=>s.apr!=null).reduce((a,s,_,arr)=>a+s.apr/arr.length,0) : 0;
+  // Summary metrics (only closed/expired for P&L stats)
+  const withPnL   = filtered.filter(s => s.netPnL != null);
+  const totalPnl  = withPnL.reduce((a, s) => a + s.netPnL, 0);
+  const totalComm = filtered.reduce((a, s) => a + s.totalComm, 0);
+  const winners   = withPnL.filter(s => s.netPnL > 0).length;
+  const winRate   = withPnL.length ? Math.round(winners / withPnL.length * 100) : 0;
+  const pctArr    = withPnL.filter(s => s.pctReturn != null).map(s => s.pctReturn);
+  const aprArr    = withPnL.filter(s => s.apr != null).map(s => s.apr);
+  const avgPct    = pctArr.length ? pctArr.reduce((a,v)=>a+v,0)/pctArr.length : 0;
+  const avgApr    = aprArr.length ? aprArr.reduce((a,v)=>a+v,0)/aprArr.length : 0;
 
   const statusBadge = s => ({
     closed:  '<span class="status-closed">CLOSED</span>',
     expired: '<span class="status-expired">EXPIRED</span>',
     open:    '<span class="status-open">OPEN</span>'
-  })[s.status];
+  })[s.status] || '';
 
   const typePill = s =>
-    `<span class="spread-type-pill ${s.optType==='P'?'spread-put':'spread-call'}">${s.optType==='P'?'PUT SPREAD':'CALL SPREAD'}</span>`;
+    `<span class="spread-type-pill ${s.optType==='P'?'spread-put':'spread-call'}">`+
+    `${s.optType==='P'?'PUT SPREAD':'CALL SPREAD'}</span>`;
 
   const spreadCard = s => {
-    const sl = s.shortLeg, ll = s.longLeg;
-    const pnlCls   = s.netPnL != null ? (s.netPnL >= 0 ? 'pos' : 'neg') : '';
-    const pctStr   = s.pctReturn != null ? (s.pctReturn >= 0 ? '+' : '') + s.pctReturn.toFixed(1) + '%' : 'Open';
-    const aprStr   = s.apr      != null ? (s.apr      >= 0 ? '+' : '') + s.apr.toFixed(0)      + '%' : 'Open';
-    const pctCls   = s.pctReturn != null ? (s.pctReturn >= 0 ? 'pos' : 'neg') : 'muted';
-    const aprCls   = s.apr      != null ? (s.apr      >= 0 ? 'pos' : 'neg') : 'muted';
+    const pnlCls = s.netPnL != null ? (s.netPnL >= 0 ? 'pos' : 'neg') : 'muted';
+    const pctStr = s.pctReturn != null
+      ? (s.pctReturn >= 0 ? '+' : '') + s.pctReturn.toFixed(1) + '%' : '—';
+    const aprStr = s.apr != null
+      ? (s.apr >= 0 ? '+' : '') + s.apr.toFixed(0) + '%' : '—';
+    const pctCls = s.pctReturn != null ? (s.pctReturn >= 0 ? 'pos' : 'neg') : 'muted';
+    const aprCls = s.apr != null ? (s.apr >= 0 ? 'pos' : 'neg') : 'muted';
 
-    // Build leg rows for the table — show all 4 trades (open short, open long, close short, close long)
     const legRows = s.allTrades.map(t => {
       const occ    = parseOCC(t.symbol);
       const strike = occ ? '$' + occ.strike.toFixed(0) : '—';
-      // Each leg's contribution: gross - commission
-      const legNet = Number(t.gross||0) - Number(t.commission||0);
+      const legNet = Number(t.gross || 0) - Number(t.commission || 0);
       const legCls = legNet >= 0 ? 'pos' : 'neg';
-      // Label: is this opening or closing?
-      const isOpening = t.date === s.openDate;
-      const roleLabel = isOpening
-        ? (t.action === 'SELL' ? 'SELL (open)' : 'BUY (insur.)')
-        : (t.action === 'BUY'  ? 'BUY (close)' : 'SELL (close)');
-
+      const isOpen = t.date === s.openDate;
+      const role   = isOpen
+        ? (t.action === 'SELL' ? 'Open short' : 'Open long')
+        : (t.action === 'BUY'  ? 'Close short' : 'Close long');
       return `
       <div class="spread-leg">
         <span>${badge(t.action)}</span>
-        <span style="font-size:10px;color:var(--muted)">${roleLabel}</span>
+        <span style="font-size:10px;color:var(--muted)">${role}</span>
         <span style="font-weight:600;font-size:11px">${t.symbol.trim()}</span>
         <span style="text-align:right">${strike}</span>
         <span style="text-align:right">${t.qty}</span>
@@ -1089,11 +1029,11 @@ function renderSpreads() {
       <div class="spread-meta">
         <div class="spread-meta-item">
           <span class="spread-meta-label">Short leg (sell)</span>
-          <span class="spread-meta-val">$${sl.occ.strike.toFixed(0)} ${s.optType}</span>
+          <span class="spread-meta-val">$${s.sl.occ.strike.toFixed(0)} ${s.optType}</span>
         </div>
         <div class="spread-meta-item">
           <span class="spread-meta-label">Long leg (insur.)</span>
-          <span class="spread-meta-val">$${ll.occ.strike.toFixed(0)} ${s.optType}</span>
+          <span class="spread-meta-val">$${s.ll.occ.strike.toFixed(0)} ${s.optType}</span>
         </div>
         <div class="spread-meta-item">
           <span class="spread-meta-label">Strike width</span>
@@ -1116,13 +1056,13 @@ function renderSpreads() {
           <span class="spread-meta-val">${s.daysHeld}d</span>
         </div>
         <div class="spread-meta-item">
-          <span class="spread-meta-label">Open credit</span>
+          <span class="spread-meta-label">Credit collected</span>
           <span class="spread-meta-val pos">${fmtSign(s.openCredit)}</span>
         </div>
-        <div class="spread-meta-item">
-          <span class="spread-meta-label">Close debit</span>
-          <span class="spread-meta-val ${s.closeDebit<0?'neg':''}">${s.closeDate?fmtSign(s.closeDebit):'—'}</span>
-        </div>
+        ${s.closeDate ? `<div class="spread-meta-item">
+          <span class="spread-meta-label">Debit to close</span>
+          <span class="spread-meta-val neg">${fmtSign(s.closeDebit)}</span>
+        </div>` : ''}
         <div class="spread-meta-item">
           <span class="spread-meta-label">Max risk</span>
           <span class="spread-meta-val neg">-${fmt(s.maxRisk)}</span>
@@ -1150,11 +1090,12 @@ function renderSpreads() {
         <div style="display:flex;gap:32px;align-items:center;flex-wrap:wrap;width:100%">
           <div>
             <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:3px">Net P&amp;L</div>
-            <div style="font-size:22px;font-weight:700" class="${pnlCls}">${s.netPnL!=null?fmtSign(s.netPnL):'Open'}</div>
+            <div style="font-size:22px;font-weight:700" class="${pnlCls}">${s.netPnL!=null ? fmtSign(s.netPnL) : 'Open'}</div>
           </div>
           <div>
             <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:3px">Return on Credit</div>
             <div style="font-size:22px;font-weight:700" class="${pctCls}">${pctStr}</div>
+            ${s.pctReturn!=null?`<div style="font-size:10px;color:var(--muted);margin-top:2px">of $${s.openCredit.toFixed(0)} collected</div>`:''}
           </div>
           <div>
             <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:3px">APR</div>
@@ -1175,7 +1116,7 @@ function renderSpreads() {
   <div class="metrics">
     <div class="metric"><div class="metric-label">Total Spreads</div><div class="metric-val">${filtered.length}</div></div>
     <div class="metric"><div class="metric-label">Realized P&amp;L</div><div class="metric-val ${totalPnl>=0?'green':'red'}">${fmtSign(totalPnl)}</div></div>
-    <div class="metric"><div class="metric-label">Win Rate</div><div class="metric-val ${winRate>=50?'green':'red'}">${winRate}% <span style="font-size:12px;font-weight:400">(${winners}/${closed.length})</span></div></div>
+    <div class="metric"><div class="metric-label">Win Rate</div><div class="metric-val ${winRate>=50?'green':'red'}">${winRate}% <span style="font-size:12px;font-weight:400">(${winners}/${withPnL.length})</span></div></div>
     <div class="metric"><div class="metric-label">Avg Return</div><div class="metric-val ${avgPct>=0?'green':'red'}">${avgPct.toFixed(1)}%</div></div>
     <div class="metric"><div class="metric-label">Avg APR</div><div class="metric-val ${avgApr>=0?'green':'red'}">${avgApr.toFixed(0)}%</div></div>
     <div class="metric"><div class="metric-label">Total Comm.</div><div class="metric-val red">-${fmt(totalComm)}</div></div>
@@ -1193,7 +1134,7 @@ function renderSpreads() {
   </div>
 
   ${filtered.length===0
-    ? '<div class="empty"><div class="empty-icon">📋</div>No spreads found. Import your IBKR CSV to see your spreads here.</div>'
+    ? '<div class="empty"><div class="empty-icon">📋</div>No spreads found. Import your IBKR CSV to see spreads here.</div>'
     : filtered.map(spreadCard).join('')}`;
 }
 
