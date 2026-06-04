@@ -124,7 +124,7 @@
   .spread-meta-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px; }
   .spread-meta-val { font-size: 13px; font-weight: 600; }
   .spread-legs { padding: 0; }
-  .spread-leg { display: grid; grid-template-columns: 80px 1fr 70px 50px 80px 80px 90px 90px; gap: 8px; align-items: center; padding: 10px 16px; border-bottom: 1px solid var(--border); font-size: 12px; }
+  .spread-leg { display: grid; grid-template-columns: 80px 90px 1fr 60px 45px 70px 75px 90px 80px; gap: 6px; align-items: center; padding: 9px 16px; border-bottom: 1px solid var(--border); font-size: 12px; }
   .spread-leg:last-child { border-bottom: none; }
   .spread-leg-header { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px; background: var(--bg3); }
   .spread-pnl-banner { display: flex; align-items: center; justify-content: space-between; padding: 10px 16px; background: var(--bg3); font-size: 13px; }
@@ -803,7 +803,6 @@ function renderActivity() {
 // ── Spreads page ─────────────────────────────────────────────
 
 // Parse OCC option symbol: "CEG   260821P00200000"
-// → { underlying:'CEG', expiry:'2026-08-21', strike:200.00, optType:'P' }
 function parseOCC(symbol) {
   if (!symbol) return null;
   const m = symbol.trim().match(/^([A-Z]+)\s+(\d{2})(\d{2})(\d{2})([CP])(\d{8})$/);
@@ -817,199 +816,316 @@ function parseOCC(symbol) {
   };
 }
 
-function fmtExpiry(iso) {
+// Safe date formatter — always append T12:00:00 to avoid UTC rollback
+function fmtD(iso) {
   if (!iso) return '—';
-  return new Date(iso + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  const d = new Date(iso.slice(0,10) + 'T12:00:00');
+  if (isNaN(d)) return iso; // fallback: show raw string
+  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+function fmtDShort(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso.slice(0,10) + 'T12:00:00');
+  if (isNaN(d)) return iso;
+  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 }
 
 function daysBetween(d1, d2) {
-  if (!d1 || !d2) return null;
-  return Math.round((new Date(d2) - new Date(d1)) / 86400000);
+  if (!d1 || !d2) return 0;
+  return Math.max(1, Math.round((new Date(d2+'T12:00:00') - new Date(d1+'T12:00:00')) / 86400000));
 }
 
-// Build spread summary objects from raw trades grouped by spreadId
+// ── Core spread builder ───────────────────────────────────────
+// Strategy: group trades by OCC symbol, then pair BUY+SELL of same symbol.
+// A spread = one short leg (sell to open) + one long leg (buy to open),
+// optionally with closing trades (buy to close + sell to close) on a different date.
+//
+// Algorithm:
+// 1. Parse every option trade → attach OCC data
+// 2. Group by symbol
+// 3. Within each symbol group, pair SELL (open) with BUY (close) chronologically
+//    and BUY (open) with SELL (close) chronologically
+// 4. Find paired symbols (same underlying, same expiry, different strike) → spread
+// 5. Merge the two symbol pairs into one spread object
+
 function buildSpreads(trades) {
-  // Group by spreadId
-  const groups = {};
-  trades.filter(t => t.spreadId).forEach(t => {
-    if (!groups[t.spreadId]) groups[t.spreadId] = [];
-    groups[t.spreadId].push(t);
+  const optTrades = trades
+    .filter(t => t.type === 'option')
+    .map(t => ({ ...t, occ: parseOCC(t.symbol) }))
+    .filter(t => t.occ);
+
+  // Group trades by exact symbol
+  const bySymbol = {};
+  optTrades.forEach(t => {
+    const key = t.symbol.trim();
+    if (!bySymbol[key]) bySymbol[key] = [];
+    bySymbol[key].push(t);
   });
 
-  const spreads = [];
+  // For each symbol, match opening and closing trades into "legs"
+  // A leg = { symbol, occ, openDate, openPrice, openAction, closeDate, closePrice, closeAction, allTrades }
+  const legs = [];
+  Object.entries(bySymbol).forEach(([sym, symTrades]) => {
+    const sorted = [...symTrades].sort((a,b) => a.date.localeCompare(b.date));
 
-  Object.entries(groups).forEach(([sid, legs]) => {
-    if (!legs.length) return;
+    // For a credit spread: first trade of a symbol is the opening leg
+    // If sold first → short leg (sell to open, buy to close)
+    // If bought first → long leg (buy to open, sell to close)
+    const sells = sorted.filter(t => t.action === 'SELL');
+    const buys  = sorted.filter(t => t.action === 'BUY');
 
-    // Attach parsed OCC to each leg
-    const parsedLegs = legs.map(l => ({ ...l, occ: parseOCC(l.symbol) }));
+    // Pair each sell with a buy (chronological)
+    // Net qty per action — handle partial fills
+    const totalSellQty = sells.reduce((s,t)=>s+Number(t.qty),0);
+    const totalBuyQty  = buys.reduce((s,t)=>s+Number(t.qty),0);
 
-    const sellLegs = parsedLegs.filter(l => l.action === 'SELL');
-    const buyLegs  = parsedLegs.filter(l => l.action === 'BUY');
+    const openSells  = sells.filter((t,i) => i === 0 || sells[0].date === t.date);
+    const closeSells = sells.filter((t,i) => sells[0].date !== t.date);
+    const openBuys   = buys.filter((t,i)  => i === 0 || buys[0].date === t.date);
+    const closeBuys  = buys.filter((t,i)  => buys[0].date !== t.date);
 
-    // Underlying from first parseable OCC symbol
-    const firstOCC = parsedLegs.find(l => l.occ);
-    const underlying = firstOCC ? firstOCC.occ.underlying : legs[0].symbol.split(/\s+/)[0].replace(/\d.*$/, '').trim();
+    // Determine open action from first trade
+    const firstTrade = sorted[0];
+    const isShortLeg = firstTrade.action === 'SELL'; // sold first = short (credit)
 
-    // Expiry (all legs share same expiry for a single spread)
-    const expiry = firstOCC ? firstOCC.occ.expiry : null;
+    const openTrades  = isShortLeg ? openSells  : openBuys;
+    const closeTrades = isShortLeg ? closeBuys  : closeSells;
 
-    // Option type: P = put spread, C = call spread
-    const optType = firstOCC ? firstOCC.occ.optType : '?';
+    const openDate   = openTrades.length  ? openTrades[0].date   : firstTrade.date;
+    const closeDate  = closeTrades.length ? closeTrades[0].date  : null;
 
-    // Dates
-    const allDates = legs.map(l => l.date).sort();
-    const openDate  = allDates[0];
-    const closeDate = allDates[allDates.length - 1] !== openDate ? allDates[allDates.length - 1] : null;
-    const daysHeld  = closeDate ? daysBetween(openDate, closeDate) : daysBetween(openDate, new Date().toISOString().slice(0, 10));
+    const openGross  = openTrades.reduce((s,t)=>s+Number(t.gross||0),0);
+    const closeGross = closeTrades.reduce((s,t)=>s+Number(t.gross||0),0);
+    const openComm   = openTrades.reduce((s,t)=>s+Number(t.commission||0),0);
+    const closeComm  = closeTrades.reduce((s,t)=>s+Number(t.commission||0),0);
 
-    // ── P&L calculations ──────────────────────────────────────
-    // Gross is already in dollars (IBKR pre-multiplies qty×price×100)
-    // Sell gross = positive (money in), Buy gross = negative (money out)
-    const totalGross = legs.reduce((s, l) => s + Number(l.gross || 0), 0);
-    const totalComm  = legs.reduce((s, l) => s + Number(l.commission || 0), 0);
-    const netPnL     = totalGross - totalComm;
+    // Average open/close price weighted by qty
+    const openQty   = openTrades.reduce((s,t)=>s+Number(t.qty),0);
+    const closeQty  = closeTrades.reduce((s,t)=>s+Number(t.qty),0);
+    const openPrice = openQty  ? openTrades.reduce((s,t)=>s+Number(t.price)*Number(t.qty),0)/openQty   : 0;
+    const closePrice= closeQty ? closeTrades.reduce((s,t)=>s+Number(t.price)*Number(t.qty),0)/closeQty : 0;
 
-    // Per-leg P&L: each leg's contribution = its gross - its commission
-    // Buy leg: you paid premium (negative gross) → contributes negative
-    // Sell leg: you received premium (positive gross) → contributes positive
-    const legPnL = parsedLegs.map(l => ({
-      ...l,
-      legPnL: Number(l.gross || 0) - Number(l.commission || 0)
-    }));
-
-    // Net credit = what you net collected (sell gross + buy gross)
-    const netCredit = totalGross; // gross already nets out
-
-    // Premium collected from sell legs only
-    const premiumCollected = sellLegs.reduce((s, l) => s + Math.abs(Number(l.gross || 0)), 0);
-    const premiumPaid      = buyLegs.reduce((s, l)  => s + Math.abs(Number(l.gross || 0)), 0);
-
-    // % profit = P&L / premium collected × 100
-    // (shows how much of collected premium you kept)
-    const pctProfit = premiumCollected > 0 ? (netPnL / premiumCollected * 100) : null;
-
-    // Strike width → max risk
-    const shortOCC = sellLegs.length ? sellLegs[0].occ : null;
-    const longOCC  = buyLegs.length  ? buyLegs[0].occ  : null;
-    const strikeWidth = (shortOCC && longOCC) ? Math.abs(shortOCC.strike - longOCC.strike) : null;
-    const qty = sellLegs.length ? sellLegs.reduce((s,l)=>s+Number(l.qty),0) : 1;
-    const maxRisk = strikeWidth ? (strikeWidth * 100 * qty) - netCredit : null;
-
-    // APR = (P&L / maxRisk) × (365 / daysHeld) × 100
-    const apr = (maxRisk && maxRisk > 0 && daysHeld && daysHeld > 0)
-      ? (netPnL / maxRisk) * (365 / daysHeld) * 100
-      : null;
-
-    // Status
-    const today   = new Date().toISOString().slice(0, 10);
-    const expired = expiry && expiry < today && !closeDate;
-    const closed  = !!closeDate;
-    const status  = closed ? 'closed' : (expired ? 'expired' : 'open');
-
-    spreads.push({
-      id: sid,
-      broker: legs[0].broker,
-      underlying, expiry, optType, status,
-      openDate, closeDate, daysHeld,
-      legs: legPnL,
-      sellLegs, buyLegs,
-      shortOCC, longOCC,
-      netCredit, premiumCollected, premiumPaid,
-      strikeWidth, qty, maxRisk,
-      netPnL, totalComm, pctProfit, apr
+    legs.push({
+      symbol: sym, occ: firstTrade.occ,
+      isShortLeg,
+      openDate, closeDate,
+      openPrice, closePrice,
+      openQty, closeQty,
+      openGross, closeGross,
+      openComm, closeComm,
+      allTrades: sorted
     });
   });
 
-  return spreads.sort((a, b) => b.openDate.localeCompare(a.openDate));
+  // ── Pair legs into spreads ───────────────────────────────────
+  // Two legs form a spread if they share: underlying, expiry, same openDate, same qty
+  // One is short (sold first), one is long (bought first)
+  const spreads = [];
+  const used = new Set();
+
+  legs.forEach((leg, i) => {
+    if (used.has(i)) return;
+    const occ = leg.occ;
+
+    // Find the paired leg
+    for (let j = i+1; j < legs.length; j++) {
+      if (used.has(j)) continue;
+      const other = legs[j];
+      const oocc  = other.occ;
+
+      // Must share underlying + expiry, same open date, different strike, opposite roles
+      if (occ.underlying !== oocc.underlying) continue;
+      if (occ.expiry !== oocc.expiry) continue;
+      if (occ.strike === oocc.strike) continue;
+      if (leg.openDate !== other.openDate) continue;
+      if (leg.isShortLeg === other.isShortLeg) continue; // must be opposite
+
+      // Found a pair
+      used.add(i); used.add(j);
+
+      const shortLeg = leg.isShortLeg ? leg : other;
+      const longLeg  = leg.isShortLeg ? other : leg;
+
+      // All 4 trades (open short, open long, close short, close long)
+      const allTrades = [...shortLeg.allTrades, ...longLeg.allTrades]
+        .sort((a,b) => a.date.localeCompare(b.date));
+
+      // Dates
+      const openDate  = shortLeg.openDate;
+      const closeDate = shortLeg.closeDate || longLeg.closeDate || null;
+      const today     = new Date().toISOString().slice(0,10);
+      const expired   = occ.expiry < today && !closeDate;
+      const status    = closeDate ? 'closed' : (expired ? 'expired' : 'open');
+      const daysHeld  = daysBetween(openDate, closeDate || today);
+
+      // P&L
+      // Net credit at open = shortLeg.openGross + longLeg.openGross
+      //   (shortLeg.openGross is positive, longLeg.openGross is negative)
+      const openCredit = shortLeg.openGross + longLeg.openGross; // net cash received
+      // Cost to close = shortLeg.closeGross + longLeg.closeGross (negative net)
+      const closeDebit = (shortLeg.closeGross || 0) + (longLeg.closeGross || 0);
+      // Total P&L = total gross inflows+outflows - total commissions
+      const totalGross = shortLeg.openGross + longLeg.openGross +
+                         (shortLeg.closeGross||0) + (longLeg.closeGross||0);
+      const totalComm  = shortLeg.openComm + longLeg.openComm +
+                         (shortLeg.closeComm||0) + (longLeg.closeComm||0);
+      const netPnL     = status === 'open' ? null : totalGross - totalComm;
+
+      // % return = P&L / openCredit × 100
+      const pctReturn  = (netPnL != null && openCredit > 0)
+        ? netPnL / openCredit * 100 : null;
+
+      // Max risk = strike width × 100 × qty - openCredit
+      const strikeWidth = Math.abs(shortLeg.occ.strike - longLeg.occ.strike);
+      const qty         = shortLeg.openQty;
+      const maxRisk     = (strikeWidth * 100 * qty) - openCredit;
+
+      // APR = (P&L / maxRisk) × (365 / daysHeld) × 100
+      const apr = (netPnL != null && maxRisk > 0 && daysHeld > 0)
+        ? (netPnL / maxRisk) * (365 / daysHeld) * 100 : null;
+
+      spreads.push({
+        id: `${occ.underlying}-${occ.expiry}-${openDate}`,
+        broker: shortLeg.allTrades[0].broker,
+        underlying: occ.underlying,
+        expiry: occ.expiry,
+        optType: occ.optType,
+        status, openDate, closeDate, daysHeld,
+        shortLeg, longLeg, allTrades,
+        strikeWidth, qty,
+        openCredit, closeDebit,
+        totalGross, totalComm, maxRisk,
+        netPnL, pctReturn, apr
+      });
+      break;
+    }
+  });
+
+  // Sort newest first
+  return spreads.sort((a,b) => b.openDate.localeCompare(a.openDate));
 }
 
+// ── Spread page renderer ──────────────────────────────────────
 function renderSpreads() {
   const trades  = state.acct === 'all' ? state.trades : state.trades.filter(t => t.broker === state.acct);
   const spreads = buildSpreads(trades);
 
   const statusFilter = window._spreadStatus || 'all';
-  const symFilter    = window._spreadSym    || '';
+  const symFilter    = (window._spreadSym || '').toLowerCase();
 
   const filtered = spreads.filter(s => {
     if (statusFilter !== 'all' && s.status !== statusFilter) return false;
-    if (symFilter && !s.underlying.toLowerCase().includes(symFilter.toLowerCase())) return false;
+    if (symFilter && !s.underlying.toLowerCase().includes(symFilter)) return false;
     return true;
   });
 
-  // Top metrics
-  const withPnL    = filtered.filter(s => s.netPnL != null);
-  const totalPnl   = withPnL.reduce((a, s) => a + s.netPnL, 0);
-  const totalComm  = filtered.reduce((a, s) => a + s.totalComm, 0);
-  const winners    = withPnL.filter(s => s.netPnL > 0).length;
-  const winRate    = withPnL.length ? Math.round(winners / withPnL.length * 100) : 0;
-  const avgPct     = withPnL.filter(s=>s.pctProfit!=null).reduce((a,s,_,arr)=>a+s.pctProfit/arr.length,0);
-  const totalCredit= filtered.reduce((a, s) => a + s.netCredit, 0);
+  // Summary metrics
+  const closed     = filtered.filter(s => s.netPnL != null);
+  const totalPnl   = closed.reduce((a,s) => a + s.netPnL, 0);
+  const totalComm  = filtered.reduce((a,s) => a + s.totalComm, 0);
+  const winners    = closed.filter(s => s.netPnL > 0).length;
+  const winRate    = closed.length ? Math.round(winners / closed.length * 100) : 0;
+  const avgPct     = closed.filter(s=>s.pctReturn!=null).length
+    ? closed.filter(s=>s.pctReturn!=null).reduce((a,s,_,arr)=>a+s.pctReturn/arr.length,0) : 0;
+  const avgApr     = closed.filter(s=>s.apr!=null).length
+    ? closed.filter(s=>s.apr!=null).reduce((a,s,_,arr)=>a+s.apr/arr.length,0) : 0;
 
   const statusBadge = s => ({
     closed:  '<span class="status-closed">CLOSED</span>',
     expired: '<span class="status-expired">EXPIRED</span>',
     open:    '<span class="status-open">OPEN</span>'
-  })[s.status] || '';
+  })[s.status];
 
   const typePill = s =>
     `<span class="spread-type-pill ${s.optType==='P'?'spread-put':'spread-call'}">${s.optType==='P'?'PUT SPREAD':'CALL SPREAD'}</span>`;
 
   const spreadCard = s => {
-    const pnlColor = s.netPnL >= 0 ? 'pos' : 'neg';
-    const pctStr   = s.pctProfit != null ? (s.pctProfit >= 0 ? '+' : '') + s.pctProfit.toFixed(1) + '%' : '—';
-    const aprStr   = s.apr != null ? (s.apr >= 0 ? '+' : '') + s.apr.toFixed(0) + '%' : '—';
-    const aprColor = s.apr != null ? (s.apr >= 0 ? 'pos' : 'neg') : '';
+    const sl = s.shortLeg, ll = s.longLeg;
+    const pnlCls   = s.netPnL != null ? (s.netPnL >= 0 ? 'pos' : 'neg') : '';
+    const pctStr   = s.pctReturn != null ? (s.pctReturn >= 0 ? '+' : '') + s.pctReturn.toFixed(1) + '%' : 'Open';
+    const aprStr   = s.apr      != null ? (s.apr      >= 0 ? '+' : '') + s.apr.toFixed(0)      + '%' : 'Open';
+    const pctCls   = s.pctReturn != null ? (s.pctReturn >= 0 ? 'pos' : 'neg') : 'muted';
+    const aprCls   = s.apr      != null ? (s.apr      >= 0 ? 'pos' : 'neg') : 'muted';
+
+    // Build leg rows for the table — show all 4 trades (open short, open long, close short, close long)
+    const legRows = s.allTrades.map(t => {
+      const occ    = parseOCC(t.symbol);
+      const strike = occ ? '$' + occ.strike.toFixed(0) : '—';
+      // Each leg's contribution: gross - commission
+      const legNet = Number(t.gross||0) - Number(t.commission||0);
+      const legCls = legNet >= 0 ? 'pos' : 'neg';
+      // Label: is this opening or closing?
+      const isOpening = t.date === s.openDate;
+      const roleLabel = isOpening
+        ? (t.action === 'SELL' ? 'SELL (open)' : 'BUY (insur.)')
+        : (t.action === 'BUY'  ? 'BUY (close)' : 'SELL (close)');
+
+      return `
+      <div class="spread-leg">
+        <span>${badge(t.action)}</span>
+        <span style="font-size:10px;color:var(--muted)">${roleLabel}</span>
+        <span style="font-weight:600;font-size:11px">${t.symbol.trim()}</span>
+        <span style="text-align:right">${strike}</span>
+        <span style="text-align:right">${t.qty}</span>
+        <span style="text-align:right">${fmt(t.price)}</span>
+        <span style="text-align:right;color:var(--muted)">-${fmt(t.commission)}</span>
+        <span style="text-align:right;font-weight:600" class="${legCls}">${fmtSign(legNet)}</span>
+        <span style="text-align:right;color:var(--muted)">${fmtDShort(t.date)}</span>
+      </div>`;
+    }).join('');
 
     return `
     <div class="spread-card">
-      <!-- Header -->
       <div class="spread-header">
         <span class="spread-symbol">${s.underlying}</span>
         ${typePill(s)}
-        <span class="spread-expiry">Exp: ${fmtExpiry(s.expiry)}</span>
+        <span class="spread-expiry">Exp: ${fmtD(s.expiry)}</span>
         ${statusBadge(s)}
         <span style="flex:1"></span>
         <span class="chip chip-${s.broker}">${BROKERS[s.broker]}</span>
       </div>
 
-      <!-- Summary metrics -->
       <div class="spread-meta">
         <div class="spread-meta-item">
-          <span class="spread-meta-label">Short (sell)</span>
-          <span class="spread-meta-val">${s.shortOCC ? '$' + s.shortOCC.strike.toFixed(0) + ' ' + s.optType : '—'}</span>
+          <span class="spread-meta-label">Short leg (sell)</span>
+          <span class="spread-meta-val">$${sl.occ.strike.toFixed(0)} ${s.optType}</span>
         </div>
         <div class="spread-meta-item">
-          <span class="spread-meta-label">Long (buy/insur.)</span>
-          <span class="spread-meta-val">${s.longOCC ? '$' + s.longOCC.strike.toFixed(0) + ' ' + s.optType : '—'}</span>
+          <span class="spread-meta-label">Long leg (insur.)</span>
+          <span class="spread-meta-val">$${ll.occ.strike.toFixed(0)} ${s.optType}</span>
         </div>
         <div class="spread-meta-item">
           <span class="spread-meta-label">Strike width</span>
-          <span class="spread-meta-val">${s.strikeWidth ? '$' + s.strikeWidth.toFixed(0) : '—'}</span>
+          <span class="spread-meta-val">$${s.strikeWidth.toFixed(0)}</span>
         </div>
         <div class="spread-meta-item">
           <span class="spread-meta-label">Contracts</span>
           <span class="spread-meta-val">${s.qty}</span>
         </div>
         <div class="spread-meta-item">
-          <span class="spread-meta-label">Net credit</span>
-          <span class="spread-meta-val ${s.netCredit>=0?'pos':'neg'}">${fmtSign(s.netCredit)}</span>
+          <span class="spread-meta-label">Opened</span>
+          <span class="spread-meta-val">${fmtD(s.openDate)}</span>
+        </div>
+        <div class="spread-meta-item">
+          <span class="spread-meta-label">${s.closeDate ? 'Closed' : 'Expiry'}</span>
+          <span class="spread-meta-val">${fmtD(s.closeDate || s.expiry)}</span>
+        </div>
+        <div class="spread-meta-item">
+          <span class="spread-meta-label">Days held</span>
+          <span class="spread-meta-val">${s.daysHeld}d</span>
+        </div>
+        <div class="spread-meta-item">
+          <span class="spread-meta-label">Open credit</span>
+          <span class="spread-meta-val pos">${fmtSign(s.openCredit)}</span>
+        </div>
+        <div class="spread-meta-item">
+          <span class="spread-meta-label">Close debit</span>
+          <span class="spread-meta-val ${s.closeDebit<0?'neg':''}">${s.closeDate?fmtSign(s.closeDebit):'—'}</span>
         </div>
         <div class="spread-meta-item">
           <span class="spread-meta-label">Max risk</span>
-          <span class="spread-meta-val neg">${s.maxRisk!=null?fmtSign(-s.maxRisk):'—'}</span>
-        </div>
-        <div class="spread-meta-item">
-          <span class="spread-meta-label">Opened</span>
-          <span class="spread-meta-val">${fmtDate(s.openDate)}</span>
-        </div>
-        ${s.closeDate ? `<div class="spread-meta-item">
-          <span class="spread-meta-label">Closed</span>
-          <span class="spread-meta-val">${fmtDate(s.closeDate)}</span>
-        </div>` : ''}
-        <div class="spread-meta-item">
-          <span class="spread-meta-label">Days held</span>
-          <span class="spread-meta-val">${s.daysHeld != null ? s.daysHeld + 'd' : '—'}</span>
+          <span class="spread-meta-val neg">-${fmt(s.maxRisk)}</span>
         </div>
         <div class="spread-meta-item">
           <span class="spread-meta-label">Total comm.</span>
@@ -1017,11 +1133,9 @@ function renderSpreads() {
         </div>
       </div>
 
-      <!-- Leg table: BUY and SELL rows with per-leg P&L -->
       <div class="spread-legs">
         <div class="spread-leg spread-leg-header">
-          <span>Action</span>
-          <span>Symbol</span>
+          <span>Action</span><span>Role</span><span>Symbol</span>
           <span style="text-align:right">Strike</span>
           <span style="text-align:right">Qty</span>
           <span style="text-align:right">Price</span>
@@ -1029,41 +1143,26 @@ function renderSpreads() {
           <span style="text-align:right">Leg P&amp;L</span>
           <span style="text-align:right">Date</span>
         </div>
-        ${s.legs.map(l => {
-          const occ = l.occ;
-          const strike = occ ? '$' + occ.strike.toFixed(0) : '—';
-          const legPnlCls = l.legPnL >= 0 ? 'pos' : 'neg';
-          return `
-          <div class="spread-leg">
-            <span>${badge(l.action)}</span>
-            <span style="font-weight:600;font-size:11px">${l.symbol.trim()}</span>
-            <span style="text-align:right">${strike}</span>
-            <span style="text-align:right">${l.qty}</span>
-            <span style="text-align:right">${fmt(l.price)}</span>
-            <span style="text-align:right;color:var(--muted)">-${fmt(l.commission)}</span>
-            <span style="text-align:right;font-weight:600" class="${legPnlCls}">${fmtSign(l.legPnL)}</span>
-            <span style="text-align:right;color:var(--muted)">${fmtDate(l.date)}</span>
-          </div>`;
-        }).join('')}
+        ${legRows}
       </div>
 
-      <!-- P&L banner -->
       <div class="spread-pnl-banner">
-        <div style="display:flex;gap:24px;align-items:center;flex-wrap:wrap">
+        <div style="display:flex;gap:32px;align-items:center;flex-wrap:wrap;width:100%">
           <div>
-            <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:2px">Net P&amp;L</div>
-            <div style="font-size:20px;font-weight:700" class="${pnlColor}">${s.netPnL!=null?fmtSign(s.netPnL):'Pending'}</div>
+            <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:3px">Net P&amp;L</div>
+            <div style="font-size:22px;font-weight:700" class="${pnlCls}">${s.netPnL!=null?fmtSign(s.netPnL):'Open'}</div>
           </div>
           <div>
-            <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:2px">% of Premium</div>
-            <div style="font-size:20px;font-weight:700" class="${pnlColor}">${pctStr}</div>
+            <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:3px">Return on Credit</div>
+            <div style="font-size:22px;font-weight:700" class="${pctCls}">${pctStr}</div>
           </div>
           <div>
-            <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:2px">APR</div>
-            <div style="font-size:20px;font-weight:700" class="${aprColor}">${aprStr}</div>
+            <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:3px">APR</div>
+            <div style="font-size:22px;font-weight:700" class="${aprCls}">${aprStr}</div>
+            ${s.apr!=null?`<div style="font-size:10px;color:var(--muted);margin-top:2px">over ${s.daysHeld} days</div>`:''}
           </div>
           <div style="margin-left:auto;text-align:right">
-            <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:2px">Commissions</div>
+            <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:3px">Commissions paid</div>
             <div style="font-size:14px;font-weight:600;color:var(--red)">-${fmt(s.totalComm)}</div>
           </div>
         </div>
@@ -1075,10 +1174,10 @@ function renderSpreads() {
   ${acctTabsHTML()}
   <div class="metrics">
     <div class="metric"><div class="metric-label">Total Spreads</div><div class="metric-val">${filtered.length}</div></div>
-    <div class="metric"><div class="metric-label">Net P&amp;L</div><div class="metric-val ${totalPnl>=0?'green':'red'}">${fmtSign(totalPnl)}</div></div>
-    <div class="metric"><div class="metric-label">Net Credit</div><div class="metric-val blue">${fmtSign(totalCredit)}</div></div>
-    <div class="metric"><div class="metric-label">Win Rate</div><div class="metric-val ${winRate>=50?'green':'red'}">${winRate}%</div></div>
-    <div class="metric"><div class="metric-label">Avg % Profit</div><div class="metric-val ${avgPct>=0?'green':'red'}">${avgPct.toFixed(1)}%</div></div>
+    <div class="metric"><div class="metric-label">Realized P&amp;L</div><div class="metric-val ${totalPnl>=0?'green':'red'}">${fmtSign(totalPnl)}</div></div>
+    <div class="metric"><div class="metric-label">Win Rate</div><div class="metric-val ${winRate>=50?'green':'red'}">${winRate}% <span style="font-size:12px;font-weight:400">(${winners}/${closed.length})</span></div></div>
+    <div class="metric"><div class="metric-label">Avg Return</div><div class="metric-val ${avgPct>=0?'green':'red'}">${avgPct.toFixed(1)}%</div></div>
+    <div class="metric"><div class="metric-label">Avg APR</div><div class="metric-val ${avgApr>=0?'green':'red'}">${avgApr.toFixed(0)}%</div></div>
     <div class="metric"><div class="metric-label">Total Comm.</div><div class="metric-val red">-${fmt(totalComm)}</div></div>
   </div>
 
@@ -1087,15 +1186,15 @@ function renderSpreads() {
     <button class="btn ${statusFilter==='open'?'btn-blue':''}"    onclick="window._spreadStatus='open';render()">Open</button>
     <button class="btn ${statusFilter==='closed'?'btn-blue':''}"  onclick="window._spreadStatus='closed';render()">Closed</button>
     <button class="btn ${statusFilter==='expired'?'btn-blue':''}" onclick="window._spreadStatus='expired';render()">Expired</button>
-    <input type="text" placeholder="Symbol..." value="${symFilter}"
+    <input type="text" placeholder="Symbol..." value="${window._spreadSym||''}"
       oninput="window._spreadSym=this.value;render()"
-      style="background:var(--bg2);border:1px solid var(--border);color:var(--text);font-family:inherit;font-size:12px;padding:6px 10px;border-radius:var(--radius);height:32px;outline:none;max-width:160px"/>
+      style="background:var(--bg2);border:1px solid var(--border);color:var(--text);font-family:inherit;
+             font-size:12px;padding:6px 10px;border-radius:var(--radius);height:32px;outline:none;max-width:160px"/>
   </div>
 
-  ${filtered.length === 0
+  ${filtered.length===0
     ? '<div class="empty"><div class="empty-icon">📋</div>No spreads found. Import your IBKR CSV to see your spreads here.</div>'
-    : filtered.map(spreadCard).join('')
-  }`;
+    : filtered.map(spreadCard).join('')}`;
 }
 
 // ── Positions page ────────────────────────────────────────────
