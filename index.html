@@ -1021,7 +1021,7 @@ function renderSpreads() {
 
   var withPnL  = filtered.filter(function(s){ return s.netPnL != null; });
   var totalPnl = withPnL.reduce(function(a,s){ return a+s.netPnL; },0);
-  var totalCom = filtered.reduce(function(a,s){ return a+s.totalComm; },0);
+  var totalComm = filtered.reduce(function(a,s){ return a+s.totalComm; },0);
   var winners  = withPnL.filter(function(s){ return s.netPnL>0; }).length;
   var winRate  = withPnL.length ? Math.round(winners/withPnL.length*100) : 0;
   var pcts     = withPnL.filter(function(s){ return s.pctReturn!=null; }).map(function(s){ return s.pctReturn; });
