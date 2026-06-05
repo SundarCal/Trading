@@ -802,338 +802,388 @@ function renderActivity() {
 
 // ── Spreads page ─────────────────────────────────────────────
 
-function parseOCC(symbol) {
-  if (!symbol) return null;
-  const m = symbol.trim().match(/^([A-Z]+)\s+(\d{2})(\d{2})(\d{2})([CP])(\d{8})$/);
+function parseOCC(sym) {
+  if (!sym) return null;
+  var m = sym.trim().match(/^([A-Z]+)\s+(\d{2})(\d{2})(\d{2})([CP])(\d{8})$/);
   if (!m) return null;
-  const [, under, yy, mm, dd, cp, strikePad] = m;
-  return { underlying: under.trim(), expiry: '20'+yy+'-'+mm+'-'+dd,
-           strike: parseInt(strikePad, 10) / 1000, optType: cp };
+  return {
+    underlying: m[1].trim(),
+    expiry:     '20'+m[2]+'-'+m[3]+'-'+m[4],
+    strike:     parseInt(m[6],10)/1000,
+    optType:    m[5]
+  };
 }
 
-// Always append T12:00:00 so local timezone never rolls the date back
-function fmtD(iso) {
+function safeDate(iso) {
   if (!iso) return '—';
-  const s = String(iso).slice(0, 10);
-  const d = new Date(s + 'T12:00:00');
-  return isNaN(d) ? s : d.toLocaleDateString('en-US', { month:'short', day:'numeric', year:'numeric' });
+  var s = String(iso).slice(0,10);
+  var d = new Date(s + 'T12:00:00');
+  if (isNaN(d.getTime())) return s;
+  return d.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'});
 }
-function fmtDShort(iso) {
+function safeDateShort(iso) {
   if (!iso) return '—';
-  const s = String(iso).slice(0, 10);
-  const d = new Date(s + 'T12:00:00');
-  return isNaN(d) ? s : d.toLocaleDateString('en-US', { month:'short', day:'numeric' });
+  var s = String(iso).slice(0,10);
+  var d = new Date(s + 'T12:00:00');
+  if (isNaN(d.getTime())) return s;
+  return d.toLocaleDateString('en-US',{month:'short',day:'numeric'});
 }
-function daysBetween(d1, d2) {
+function calcDays(d1, d2) {
   if (!d1 || !d2) return 1;
-  const diff = Math.round((new Date(String(d2).slice(0,10)+'T12:00:00') -
-                           new Date(String(d1).slice(0,10)+'T12:00:00')) / 86400000);
-  return Math.max(1, diff);
+  var ms = new Date(String(d2).slice(0,10)+'T12:00:00') - new Date(String(d1).slice(0,10)+'T12:00:00');
+  return Math.max(1, Math.round(ms/86400000));
+}
+function colorVal(n) {
+  if (n == null) return 'color:var(--muted)';
+  return n >= 0 ? 'color:var(--green)' : 'color:var(--red)';
+}
+function signStr(n, decimals) {
+  if (n == null) return '—';
+  decimals = decimals || 2;
+  var abs = Math.abs(n).toFixed(decimals);
+  return (n >= 0 ? '+$' : '-$') + parseFloat(abs).toLocaleString('en-US',{minimumFractionDigits:decimals,maximumFractionDigits:decimals});
+}
+function pctStr(n) {
+  if (n == null) return '—';
+  return (n >= 0 ? '+' : '') + n.toFixed(1) + '%';
+}
+function aprStr(n) {
+  if (n == null) return '—';
+  return (n >= 0 ? '+' : '') + n.toFixed(0) + '%';
 }
 
 function buildSpreads(trades) {
-  // 1. Keep only option trades with parseable OCC symbols
-  const optTrades = trades
-    .filter(t => t.type === 'option')
-    .map(t => ({ ...t, occ: parseOCC(t.symbol) }))
-    .filter(t => t.occ);
+  // 1. Filter to options only, parse OCC
+  var opts = [];
+  for (var i=0; i<trades.length; i++) {
+    var t = trades[i];
+    if (t.type !== 'option') continue;
+    var occ = parseOCC(t.symbol);
+    if (!occ) continue;
+    opts.push({
+      date:       String(t.date||'').slice(0,10),
+      action:     t.action,
+      symbol:     String(t.symbol).trim(),
+      qty:        Math.abs(Number(t.qty)||0),
+      price:      Math.abs(Number(t.price)||0),
+      gross:      Number(t.gross||0),
+      commission: Math.abs(Number(t.commission)||0),
+      broker:     t.broker,
+      occ:        occ
+    });
+  }
 
-  // 2. Group by exact trimmed symbol
-  const bySymbol = {};
-  optTrades.forEach(t => {
-    const key = t.symbol.trim();
-    if (!bySymbol[key]) bySymbol[key] = [];
-    bySymbol[key].push(t);
-  });
+  // 2. Group by exact symbol
+  var bySymbol = {};
+  for (var i=0; i<opts.length; i++) {
+    var t = opts[i];
+    if (!bySymbol[t.symbol]) bySymbol[t.symbol] = [];
+    bySymbol[t.symbol].push(t);
+  }
 
-  // 3. For each symbol, determine open/close trades
-  //    Opening trade = first trade chronologically
-  //    Closing trade = later trades with the OPPOSITE action
-  const legs = [];
-  Object.entries(bySymbol).forEach(([sym, symTrades]) => {
-    const sorted     = [...symTrades].sort((a, b) => a.date.localeCompare(b.date));
-    const openDate   = sorted[0].date;
-    const openAction = sorted[0].action;              // SELL = short leg, BUY = long leg
-    const closeAction = openAction === 'SELL' ? 'BUY' : 'SELL';
+  // 3. Build a leg for each symbol
+  // Rule: sort by date. First date = open. Later date opposite action = close.
+  var legs = [];
+  var symbols = Object.keys(bySymbol);
+  for (var si=0; si<symbols.length; si++) {
+    var sym = symbols[si];
+    var ts  = bySymbol[sym].slice().sort(function(a,b){ return a.date.localeCompare(b.date); });
+    var openDate    = ts[0].date;
+    var openAction  = ts[0].action;
+    var closeAction = openAction === 'SELL' ? 'BUY' : 'SELL';
 
-    const openTrades  = sorted.filter(t => t.date === openDate);
-    const closeTrades = sorted.filter(t => t.date !== openDate && t.action === closeAction);
-    const closeDate   = closeTrades.length ? closeTrades[0].date : null;
+    var openTrades  = ts.filter(function(t){ return t.date === openDate; });
+    var closeTrades = ts.filter(function(t){ return t.date !== openDate && t.action === closeAction; });
+
+    var closeDate = closeTrades.length ? closeTrades[0].date : null;
+    var openQty   = openTrades.reduce(function(s,t){ return s+t.qty; },0);
+    var openGross = openTrades.reduce(function(s,t){ return s+t.gross; },0);
+    var openComm  = openTrades.reduce(function(s,t){ return s+t.commission; },0);
+    var closeGross= closeTrades.reduce(function(s,t){ return s+t.gross; },0);
+    var closeComm = closeTrades.reduce(function(s,t){ return s+t.commission; },0);
+
+    // Weighted avg price for open and close
+    var openPriceTotal = openTrades.reduce(function(s,t){ return s+t.price*t.qty; },0);
+    var closePriceTotal= closeTrades.reduce(function(s,t){ return s+t.price*t.qty; },0);
+    var openCloseQty   = closeTrades.reduce(function(s,t){ return s+t.qty; },0);
 
     legs.push({
-      symbol: sym,
-      occ: sorted[0].occ,
-      isShortLeg: openAction === 'SELL',
-      openDate,
-      closeDate,
-      openQty:    openTrades.reduce((s,t)  => s + Number(t.qty), 0),
-      openGross:  openTrades.reduce((s,t)  => s + Number(t.gross || 0), 0),
-      closeGross: closeTrades.reduce((s,t) => s + Number(t.gross || 0), 0),
-      openComm:   openTrades.reduce((s,t)  => s + Number(t.commission || 0), 0),
-      closeComm:  closeTrades.reduce((s,t) => s + Number(t.commission || 0), 0),
-      openPrice:  openTrades[0] ? Number(openTrades[0].price) : 0,
-      closePrice: closeTrades[0] ? Number(closeTrades[0].price) : 0,
-      allTrades:  sorted
+      symbol:      sym,
+      occ:         ts[0].occ,
+      isShort:     openAction === 'SELL',
+      openDate:    openDate,
+      closeDate:   closeDate,
+      openQty:     openQty,
+      openGross:   openGross,
+      openComm:    openComm,
+      openPrice:   openQty  ? openPriceTotal/openQty   : 0,
+      closeGross:  closeGross,
+      closeComm:   closeComm,
+      closePrice:  openCloseQty ? closePriceTotal/openCloseQty : 0,
+      broker:      ts[0].broker,
+      allTrades:   ts
     });
-  });
+  }
 
-  // 4. Pair legs: same underlying + expiry + openDate, opposite isShortLeg, different strike
-  const spreads = [];
-  const used    = new Set();
+  // 4. Pair legs into spreads
+  // Match: same underlying, same expiry, same openDate, different strike, opposite isShort
+  var spreads = [];
+  var used = {};
+  for (var i=0; i<legs.length; i++) {
+    if (used[i]) continue;
+    var leg = legs[i];
+    for (var j=i+1; j<legs.length; j++) {
+      if (used[j]) continue;
+      var other = legs[j];
+      if (leg.occ.underlying !== other.occ.underlying) continue;
+      if (leg.occ.expiry     !== other.occ.expiry)     continue;
+      if (leg.occ.strike     === other.occ.strike)      continue;
+      if (leg.openDate       !== other.openDate)         continue;
+      if (leg.isShort        === other.isShort)          continue;
+      used[i] = true; used[j] = true;
 
-  legs.forEach((leg, i) => {
-    if (used.has(i)) return;
-    legs.forEach((other, j) => {
-      if (j <= i || used.has(j)) return;
-      if (leg.occ.underlying !== other.occ.underlying) return;
-      if (leg.occ.expiry     !== other.occ.expiry)     return;
-      if (leg.occ.strike     === other.occ.strike)      return;
-      if (leg.openDate       !== other.openDate)         return;
-      if (leg.isShortLeg     === other.isShortLeg)       return;
+      var sl = leg.isShort ? leg   : other;  // short = sold first
+      var ll = leg.isShort ? other : leg;    // long  = bought first
 
-      used.add(i); used.add(j);
+      var openCredit = sl.openGross  + ll.openGross;
+      var closeDebit = sl.closeGross + ll.closeGross;
+      var totalGross = openCredit + closeDebit;
+      var totalComm  = sl.openComm + ll.openComm + sl.closeComm + ll.closeComm;
 
-      const sl = leg.isShortLeg ? leg : other;   // short = sold first
-      const ll = leg.isShortLeg ? other : leg;   // long  = bought first
+      var closeDate = sl.closeDate || ll.closeDate || null;
+      var today     = new Date().toISOString().slice(0,10);
+      var expiry    = sl.occ.expiry;
+      var isExpired = (expiry < today) && !closeDate;
+      var isClosed  = !!closeDate || isExpired;
+      var status    = closeDate ? 'closed' : (isExpired ? 'expired' : 'open');
+      var endDate   = closeDate || (isExpired ? expiry : today);
+      var daysHeld  = calcDays(sl.openDate, endDate);
 
-      const openCredit = sl.openGross  + ll.openGross;   // net cash at open (positive = credit)
-      const closeDebit = sl.closeGross + ll.closeGross;  // net cash at close (negative = debit paid)
-      const totalGross = openCredit + closeDebit;
-      const totalComm  = sl.openComm + ll.openComm + sl.closeComm + ll.closeComm;
+      var netPnL   = isClosed ? (totalGross - totalComm) : null;
+      var strikeW  = Math.abs(sl.occ.strike - ll.occ.strike);
+      var qty      = sl.openQty;
+      var maxRisk  = (strikeW * 100 * qty) - openCredit;
 
-      const closeDate  = sl.closeDate || ll.closeDate || null;
-      const today      = new Date().toISOString().slice(0, 10);
-      const expiry     = sl.occ.expiry;
-      const isExpired  = expiry < today && !closeDate;
-      const isClosed   = !!closeDate || isExpired;       // closed by trade OR by expiry
-      const status     = closeDate ? 'closed' : (isExpired ? 'expired' : 'open');
-
-      // For P&L: expired worthless = no debit to close, full credit kept
-      const netPnL    = isClosed ? totalGross - totalComm : null;
-
-      // Days held: open → close date, or open → expiry date for expired, or open → today for open
-      const endDate   = closeDate || (isExpired ? expiry : today);
-      const daysHeld  = daysBetween(sl.openDate, endDate);
-
-      const strikeWidth = Math.abs(sl.occ.strike - ll.occ.strike);
-      const qty         = sl.openQty;
-      const maxRisk     = (strikeWidth * 100 * qty) - openCredit;
-
-      // % return = P&L / credit collected at open
-      const pctReturn   = (isClosed && netPnL != null && openCredit > 0)
+      var pctReturn = (isClosed && netPnL != null && openCredit > 0)
         ? (netPnL / openCredit * 100) : null;
-
-      // APR = (P&L / maxRisk) × (365 / daysHeld) × 100
-      const apr = (isClosed && netPnL != null && maxRisk > 0 && daysHeld > 0)
+      var apr = (isClosed && netPnL != null && maxRisk > 0 && daysHeld > 0)
         ? (netPnL / maxRisk) * (365 / daysHeld) * 100 : null;
 
-      // Merge all 4 trades for the leg table
-      const allTrades = [...sl.allTrades, ...ll.allTrades]
-        .sort((a, b) => a.date.localeCompare(b.date));
+      var allTrades = sl.allTrades.concat(ll.allTrades)
+        .sort(function(a,b){ return a.date.localeCompare(b.date); });
 
       spreads.push({
-        id: sl.occ.underlying + '-' + expiry + '-' + sl.openDate,
-        broker: sl.allTrades[0].broker,
-        underlying: sl.occ.underlying,
-        expiry, optType: sl.occ.optType,
-        status, openDate: sl.openDate, closeDate, daysHeld,
-        sl, ll, allTrades,
-        strikeWidth, qty,
-        openCredit, closeDebit,
-        totalGross, totalComm, maxRisk,
-        netPnL, pctReturn, apr
+        id:          sl.occ.underlying+'-'+expiry+'-'+sl.openDate,
+        broker:      sl.broker,
+        underlying:  sl.occ.underlying,
+        expiry:      expiry,
+        optType:     sl.occ.optType,
+        status:      status,
+        openDate:    sl.openDate,
+        closeDate:   closeDate,
+        daysHeld:    daysHeld,
+        sl:          sl,
+        ll:          ll,
+        allTrades:   allTrades,
+        strikeW:     strikeW,
+        qty:         qty,
+        openCredit:  openCredit,
+        closeDebit:  closeDebit,
+        totalGross:  totalGross,
+        totalComm:   totalComm,
+        maxRisk:     maxRisk,
+        netPnL:      netPnL,
+        pctReturn:   pctReturn,
+        apr:         apr
       });
-    });
-  });
+      break;
+    }
+  }
 
-  return spreads.sort((a, b) => b.openDate.localeCompare(a.openDate));
+  spreads.sort(function(a,b){ return b.openDate.localeCompare(a.openDate); });
+  return spreads;
 }
 
 function renderSpreads() {
-  const trades  = state.acct === 'all' ? state.trades : state.trades.filter(t => t.broker === state.acct);
-  const spreads = buildSpreads(trades);
+  var allTrades = state.acct === 'all' ? state.trades : state.trades.filter(function(t){ return t.broker === state.acct; });
+  var spreads   = buildSpreads(allTrades);
 
-  const statusFilter = window._spreadStatus || 'all';
-  const symFilter    = (window._spreadSym   || '').toLowerCase();
-
-  const filtered = spreads.filter(s => {
-    if (statusFilter !== 'all' && s.status !== statusFilter) return false;
-    if (symFilter && !s.underlying.toLowerCase().includes(symFilter)) return false;
+  var statusF = window._spreadStatus || 'all';
+  var symF    = (window._spreadSym || '').toLowerCase();
+  var filtered = spreads.filter(function(s){
+    if (statusF !== 'all' && s.status !== statusF) return false;
+    if (symF && s.underlying.toLowerCase().indexOf(symF) === -1) return false;
     return true;
   });
 
-  // Summary metrics (only closed/expired for P&L stats)
-  const withPnL   = filtered.filter(s => s.netPnL != null);
-  const totalPnl  = withPnL.reduce((a, s) => a + s.netPnL, 0);
-  const totalComm = filtered.reduce((a, s) => a + s.totalComm, 0);
-  const winners   = withPnL.filter(s => s.netPnL > 0).length;
-  const winRate   = withPnL.length ? Math.round(winners / withPnL.length * 100) : 0;
-  const pctArr    = withPnL.filter(s => s.pctReturn != null).map(s => s.pctReturn);
-  const aprArr    = withPnL.filter(s => s.apr != null).map(s => s.apr);
-  const avgPct    = pctArr.length ? pctArr.reduce((a,v)=>a+v,0)/pctArr.length : 0;
-  const avgApr    = aprArr.length ? aprArr.reduce((a,v)=>a+v,0)/aprArr.length : 0;
+  var withPnL  = filtered.filter(function(s){ return s.netPnL != null; });
+  var totalPnl = withPnL.reduce(function(a,s){ return a+s.netPnL; },0);
+  var totalCom = filtered.reduce(function(a,s){ return a+s.totalComm; },0);
+  var winners  = withPnL.filter(function(s){ return s.netPnL>0; }).length;
+  var winRate  = withPnL.length ? Math.round(winners/withPnL.length*100) : 0;
+  var pcts     = withPnL.filter(function(s){ return s.pctReturn!=null; }).map(function(s){ return s.pctReturn; });
+  var aprs     = withPnL.filter(function(s){ return s.apr!=null; }).map(function(s){ return s.apr; });
+  var avgPct   = pcts.length ? pcts.reduce(function(a,v){ return a+v; },0)/pcts.length : 0;
+  var avgApr   = aprs.length ? aprs.reduce(function(a,v){ return a+v; },0)/aprs.length : 0;
 
-  const statusBadge = s => ({
-    closed:  '<span class="status-closed">CLOSED</span>',
-    expired: '<span class="status-expired">EXPIRED</span>',
-    open:    '<span class="status-open">OPEN</span>'
-  })[s.status] || '';
+  function statusBadge(s) {
+    if (s.status==='closed')  return '<span class="status-closed">CLOSED</span>';
+    if (s.status==='expired') return '<span class="status-expired">EXPIRED</span>';
+    return '<span class="status-open">OPEN</span>';
+  }
 
-  const typePill = s =>
-    `<span class="spread-type-pill ${s.optType==='P'?'spread-put':'spread-call'}">`+
-    `${s.optType==='P'?'PUT SPREAD':'CALL SPREAD'}</span>`;
+  function makeCard(s) {
+    var sl = s.sl; var ll = s.ll;
 
-  const spreadCard = s => {
-    const pnlCls = s.netPnL != null ? (s.netPnL >= 0 ? 'pos' : 'neg') : 'muted';
-    const pctStr = s.pctReturn != null
-      ? (s.pctReturn >= 0 ? '+' : '') + s.pctReturn.toFixed(1) + '%' : '—';
-    const aprStr = s.apr != null
-      ? (s.apr >= 0 ? '+' : '') + s.apr.toFixed(0) + '%' : '—';
-    const pctCls = s.pctReturn != null ? (s.pctReturn >= 0 ? 'pos' : 'neg') : 'muted';
-    const aprCls = s.apr != null ? (s.apr >= 0 ? 'pos' : 'neg') : 'muted';
+    // ── Leg table rows ────────────────────────────────────────
+    var legHTML = '';
+    for (var i=0; i<s.allTrades.length; i++) {
+      var t    = s.allTrades[i];
+      var occ  = parseOCC(t.symbol);
+      var strk = occ ? '$'+occ.strike.toFixed(0) : '—';
+      var legNet = Number(t.gross||0) - Number(t.commission||0);
+      var isOpening = t.date === s.openDate;
+      var role;
+      if (isOpening) {
+        role = t.action === 'SELL' ? 'Open short' : 'Open long';
+      } else {
+        role = t.action === 'BUY'  ? 'Close short' : 'Close long';
+      }
+      legHTML +=
+        '<tr>' +
+        '<td>' + (t.action==='BUY'
+          ? '<span class="badge badge-buy">BUY</span>'
+          : '<span class="badge badge-sell">SELL</span>') + '</td>' +
+        '<td style="color:var(--muted);font-size:10px">' + role + '</td>' +
+        '<td style="font-weight:600;font-size:11px">' + t.symbol.trim() + '</td>' +
+        '<td>' + strk + '</td>' +
+        '<td>' + t.qty + '</td>' +
+        '<td>' + fmt(t.price) + '</td>' +
+        '<td style="color:var(--muted)">-' + fmt(t.commission) + '</td>' +
+        '<td style="font-weight:700;' + colorVal(legNet) + '">' + signStr(legNet) + '</td>' +
+        '<td style="color:var(--muted)">' + safeDateShort(t.date) + '</td>' +
+        '</tr>';
+    }
 
-    const legRows = s.allTrades.map(t => {
-      const occ    = parseOCC(t.symbol);
-      const strike = occ ? '$' + occ.strike.toFixed(0) : '—';
-      const legNet = Number(t.gross || 0) - Number(t.commission || 0);
-      const legCls = legNet >= 0 ? 'pos' : 'neg';
-      const isOpen = t.date === s.openDate;
-      const role   = isOpen
-        ? (t.action === 'SELL' ? 'Open short' : 'Open long')
-        : (t.action === 'BUY'  ? 'Close short' : 'Close long');
-      // NOTE: use string concat here — no backticks — to avoid breaking the outer template literal
-      return '<div class="spread-leg">'
-        + '<span>' + badge(t.action) + '</span>'
-        + '<span style="font-size:10px;color:var(--muted)">' + role + '</span>'
-        + '<span style="font-weight:600;font-size:11px">' + t.symbol.trim() + '</span>'
-        + '<span style="text-align:right">' + strike + '</span>'
-        + '<span style="text-align:right">' + t.qty + '</span>'
-        + '<span style="text-align:right">' + fmt(t.price) + '</span>'
-        + '<span style="text-align:right;color:var(--muted)">-' + fmt(t.commission) + '</span>'
-        + '<span style="text-align:right;font-weight:600;color:' + (legNet>=0?'var(--green)':'var(--red)') + '">' + fmtSign(legNet) + '</span>'
-        + '<span style="text-align:right;color:var(--muted)">' + fmtDShort(t.date) + '</span>'
-        + '</div>';
-    }).join('');
+    // ── P&L summary row ───────────────────────────────────────
+    var pnlHTML =
+      '<div style="display:flex;gap:0;border-top:1px solid var(--border)">' +
 
-    return `
-    <div class="spread-card">
-      <div class="spread-header">
-        <span class="spread-symbol">${s.underlying}</span>
-        ${typePill(s)}
-        <span class="spread-expiry">Exp: ${fmtD(s.expiry)}</span>
-        ${statusBadge(s)}
-        <span style="flex:1"></span>
-        <span class="chip chip-${s.broker}">${BROKERS[s.broker]}</span>
-      </div>
+      '<div style="flex:1;padding:16px 20px;border-right:1px solid var(--border)">' +
+      '<div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:6px">Net P&amp;L</div>' +
+      '<div style="font-size:24px;font-weight:800;' + colorVal(s.netPnL) + '">' +
+        (s.netPnL != null ? signStr(s.netPnL) : '<span style="color:var(--muted)">Open</span>') +
+      '</div>' +
+      '</div>' +
 
-      <div class="spread-meta">
-        <div class="spread-meta-item">
-          <span class="spread-meta-label">Short leg (sell)</span>
-          <span class="spread-meta-val">$${s.sl.occ.strike.toFixed(0)} ${s.optType}</span>
-        </div>
-        <div class="spread-meta-item">
-          <span class="spread-meta-label">Long leg (insur.)</span>
-          <span class="spread-meta-val">$${s.ll.occ.strike.toFixed(0)} ${s.optType}</span>
-        </div>
-        <div class="spread-meta-item">
-          <span class="spread-meta-label">Strike width</span>
-          <span class="spread-meta-val">$${s.strikeWidth.toFixed(0)}</span>
-        </div>
-        <div class="spread-meta-item">
-          <span class="spread-meta-label">Contracts</span>
-          <span class="spread-meta-val">${s.qty}</span>
-        </div>
-        <div class="spread-meta-item">
-          <span class="spread-meta-label">Opened</span>
-          <span class="spread-meta-val">${fmtD(s.openDate)}</span>
-        </div>
-        <div class="spread-meta-item">
-          <span class="spread-meta-label">${s.closeDate ? 'Closed' : 'Expiry'}</span>
-          <span class="spread-meta-val">${fmtD(s.closeDate || s.expiry)}</span>
-        </div>
-        <div class="spread-meta-item">
-          <span class="spread-meta-label">Days held</span>
-          <span class="spread-meta-val">${s.daysHeld}d</span>
-        </div>
-        <div class="spread-meta-item">
-          <span class="spread-meta-label">Credit collected</span>
-          <span class="spread-meta-val pos">${fmtSign(s.openCredit)}</span>
-        </div>
-        ${s.closeDate ? '<div class="spread-meta-item"><span class="spread-meta-label">Debit to close</span><span class="spread-meta-val neg">' + fmtSign(s.closeDebit) + '</span></div>' : ''}
-        <div class="spread-meta-item">
-          <span class="spread-meta-label">Max risk</span>
-          <span class="spread-meta-val neg">-${fmt(s.maxRisk)}</span>
-        </div>
-        <div class="spread-meta-item">
-          <span class="spread-meta-label">Total comm.</span>
-          <span class="spread-meta-val neg">-${fmt(s.totalComm)}</span>
-        </div>
-      </div>
+      '<div style="flex:1;padding:16px 20px;border-right:1px solid var(--border)">' +
+      '<div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:6px">Return on Credit</div>' +
+      '<div style="font-size:24px;font-weight:800;' + colorVal(s.pctReturn) + '">' +
+        (s.pctReturn != null ? pctStr(s.pctReturn) : '<span style="color:var(--muted)">Open</span>') +
+      '</div>' +
+      (s.pctReturn != null ? '<div style="font-size:11px;color:var(--muted);margin-top:3px">of ' + fmt(s.openCredit) + ' collected</div>' : '') +
+      '</div>' +
 
-      <div class="spread-legs">
-        <div class="spread-leg spread-leg-header">
-          <span>Action</span><span>Role</span><span>Symbol</span>
-          <span style="text-align:right">Strike</span>
-          <span style="text-align:right">Qty</span>
-          <span style="text-align:right">Price</span>
-          <span style="text-align:right">Comm</span>
-          <span style="text-align:right">Leg P&amp;L</span>
-          <span style="text-align:right">Date</span>
-        </div>
-        ${legRows}
-      </div>
+      '<div style="flex:1;padding:16px 20px;border-right:1px solid var(--border)">' +
+      '<div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:6px">APR</div>' +
+      '<div style="font-size:24px;font-weight:800;' + colorVal(s.apr) + '">' +
+        (s.apr != null ? aprStr(s.apr) : '<span style="color:var(--muted)">Open</span>') +
+      '</div>' +
+      '<div style="font-size:11px;color:var(--muted);margin-top:3px">' + s.daysHeld + ' days held</div>' +
+      '</div>' +
 
-      <div class="spread-pnl-banner">
-        <div style="display:flex;gap:32px;align-items:center;flex-wrap:wrap;width:100%">
-          <div>
-            <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:3px">Net P&amp;L</div>
-            <div style="font-size:22px;font-weight:700" class="${pnlCls}">${s.netPnL!=null ? fmtSign(s.netPnL) : 'Open'}</div>
-          </div>
-          <div>
-            <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:3px">Return on Credit</div>
-            <div style="font-size:22px;font-weight:700" class="${pctCls}">${pctStr}</div>
-            ${s.pctReturn!=null ? '<div style="font-size:10px;color:var(--muted);margin-top:2px">of $' + s.openCredit.toFixed(0) + ' collected</div>' : ''}
-          </div>
-          <div>
-            <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:3px">APR</div>
-            <div style="font-size:22px;font-weight:700" class="${aprCls}">${aprStr}</div>
-            ${s.apr!=null ? '<div style="font-size:10px;color:var(--muted);margin-top:2px">over ' + s.daysHeld + ' days</div>' : ''}
-          </div>
-          <div style="margin-left:auto;text-align:right">
-            <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:3px">Commissions paid</div>
-            <div style="font-size:14px;font-weight:600;color:var(--red)">-${fmt(s.totalComm)}</div>
-          </div>
-        </div>
-      </div>
-    </div>`;
-  };
+      '<div style="flex:1;padding:16px 20px">' +
+      '<div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:6px">Commissions</div>' +
+      '<div style="font-size:24px;font-weight:800;color:var(--red)">-' + fmt(s.totalComm) + '</div>' +
+      '</div>' +
 
-  return `
-  ${acctTabsHTML()}
-  <div class="metrics">
-    <div class="metric"><div class="metric-label">Total Spreads</div><div class="metric-val">${filtered.length}</div></div>
-    <div class="metric"><div class="metric-label">Realized P&amp;L</div><div class="metric-val ${totalPnl>=0?'green':'red'}">${fmtSign(totalPnl)}</div></div>
-    <div class="metric"><div class="metric-label">Win Rate</div><div class="metric-val ${winRate>=50?'green':'red'}">${winRate}% <span style="font-size:12px;font-weight:400">(${winners}/${withPnL.length})</span></div></div>
-    <div class="metric"><div class="metric-label">Avg Return</div><div class="metric-val ${avgPct>=0?'green':'red'}">${avgPct.toFixed(1)}%</div></div>
-    <div class="metric"><div class="metric-label">Avg APR</div><div class="metric-val ${avgApr>=0?'green':'red'}">${avgApr.toFixed(0)}%</div></div>
-    <div class="metric"><div class="metric-label">Total Comm.</div><div class="metric-val red">-${fmt(totalComm)}</div></div>
-  </div>
+      '</div>';
 
-  <div class="spread-filters">
-    <button class="btn ${statusFilter==='all'?'btn-blue':''}"     onclick="window._spreadStatus='all';render()">All</button>
-    <button class="btn ${statusFilter==='open'?'btn-blue':''}"    onclick="window._spreadStatus='open';render()">Open</button>
-    <button class="btn ${statusFilter==='closed'?'btn-blue':''}"  onclick="window._spreadStatus='closed';render()">Closed</button>
-    <button class="btn ${statusFilter==='expired'?'btn-blue':''}" onclick="window._spreadStatus='expired';render()">Expired</button>
-    <input type="text" placeholder="Symbol..." value="${window._spreadSym||''}"
-      oninput="window._spreadSym=this.value;render()"
-      style="background:var(--bg2);border:1px solid var(--border);color:var(--text);font-family:inherit;
-             font-size:12px;padding:6px 10px;border-radius:var(--radius);height:32px;outline:none;max-width:160px"/>
-  </div>
+    // ── Card ──────────────────────────────────────────────────
+    var shortStrike = sl.occ.strike.toFixed(0);
+    var longStrike  = ll.occ.strike.toFixed(0);
+    var typeLabel   = s.optType === 'P' ? 'PUT SPREAD' : 'CALL SPREAD';
+    var typeCls     = s.optType === 'P' ? 'spread-put'  : 'spread-call';
 
-  ${filtered.length===0
+    return '<div class="spread-card">' +
+
+      // Header
+      '<div class="spread-header">' +
+      '<span class="spread-symbol">' + s.underlying + '</span>' +
+      '<span class="spread-type-pill ' + typeCls + '">' + typeLabel + '</span>' +
+      '<span class="spread-expiry">Exp: ' + safeDate(s.expiry) + '</span>' +
+      statusBadge(s) +
+      '<span style="flex:1"></span>' +
+      '<span class="chip chip-' + s.broker + '">' + BROKERS[s.broker] + '</span>' +
+      '</div>' +
+
+      // Meta grid
+      '<div class="spread-meta">' +
+      '<div class="spread-meta-item"><span class="spread-meta-label">Short strike</span><span class="spread-meta-val">$' + shortStrike + ' ' + s.optType + '</span></div>' +
+      '<div class="spread-meta-item"><span class="spread-meta-label">Long strike</span><span class="spread-meta-val">$' + longStrike  + ' ' + s.optType + '</span></div>' +
+      '<div class="spread-meta-item"><span class="spread-meta-label">Width</span><span class="spread-meta-val">$' + s.strikeW.toFixed(0) + '</span></div>' +
+      '<div class="spread-meta-item"><span class="spread-meta-label">Contracts</span><span class="spread-meta-val">' + s.qty + '</span></div>' +
+      '<div class="spread-meta-item"><span class="spread-meta-label">Opened</span><span class="spread-meta-val">' + safeDate(s.openDate) + '</span></div>' +
+      '<div class="spread-meta-item"><span class="spread-meta-label">' + (s.closeDate ? 'Closed' : 'Expiry') + '</span><span class="spread-meta-val">' + safeDate(s.closeDate||s.expiry) + '</span></div>' +
+      '<div class="spread-meta-item"><span class="spread-meta-label">Short open px</span><span class="spread-meta-val pos">+' + fmt(sl.openPrice) + '</span></div>' +
+      '<div class="spread-meta-item"><span class="spread-meta-label">Long open px</span><span class="spread-meta-val neg">-' + fmt(ll.openPrice) + '</span></div>' +
+      (s.closeDate ? '<div class="spread-meta-item"><span class="spread-meta-label">Short close px</span><span class="spread-meta-val neg">-' + fmt(sl.closePrice) + '</span></div>' : '') +
+      (s.closeDate ? '<div class="spread-meta-item"><span class="spread-meta-label">Long close px</span><span class="spread-meta-val pos">+' + fmt(ll.closePrice) + '</span></div>' : '') +
+      '<div class="spread-meta-item"><span class="spread-meta-label">Credit collected</span><span class="spread-meta-val pos">' + fmt(s.openCredit) + '</span></div>' +
+      '<div class="spread-meta-item"><span class="spread-meta-label">Max risk</span><span class="spread-meta-val neg">-' + fmt(s.maxRisk) + '</span></div>' +
+      '</div>' +
+
+      // Leg table
+      '<div style="overflow-x:auto">' +
+      '<table style="width:100%;border-collapse:collapse;font-size:12px">' +
+      '<thead><tr style="background:var(--bg2)">' +
+      '<th style="padding:8px 12px;text-align:left;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;border-bottom:1px solid var(--border)">Action</th>' +
+      '<th style="padding:8px 12px;text-align:left;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;border-bottom:1px solid var(--border)">Role</th>' +
+      '<th style="padding:8px 12px;text-align:left;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;border-bottom:1px solid var(--border)">Symbol</th>' +
+      '<th style="padding:8px 12px;text-align:right;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;border-bottom:1px solid var(--border)">Strike</th>' +
+      '<th style="padding:8px 12px;text-align:right;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;border-bottom:1px solid var(--border)">Qty</th>' +
+      '<th style="padding:8px 12px;text-align:right;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;border-bottom:1px solid var(--border)">Price</th>' +
+      '<th style="padding:8px 12px;text-align:right;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;border-bottom:1px solid var(--border)">Comm</th>' +
+      '<th style="padding:8px 12px;text-align:right;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;border-bottom:1px solid var(--border)">Leg P&L</th>' +
+      '<th style="padding:8px 12px;text-align:right;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;border-bottom:1px solid var(--border)">Date</th>' +
+      '</tr></thead>' +
+      '<tbody>' + legHTML + '</tbody>' +
+      '</table></div>' +
+
+      // P&L banner
+      pnlHTML +
+
+      '</div>';
+  }
+
+  // ── Build full page HTML using string concat only ─────────────
+  var filterBtns =
+    '<div class="spread-filters">' +
+    '<button class="btn ' + (statusF==='all'?'btn-blue':'') + '" onclick="window._spreadStatus=\'all\';render()">All</button>' +
+    '<button class="btn ' + (statusF==='open'?'btn-blue':'') + '" onclick="window._spreadStatus=\'open\';render()">Open</button>' +
+    '<button class="btn ' + (statusF==='closed'?'btn-blue':'') + '" onclick="window._spreadStatus=\'closed\';render()">Closed</button>' +
+    '<button class="btn ' + (statusF==='expired'?'btn-blue':'') + '" onclick="window._spreadStatus=\'expired\';render()">Expired</button>' +
+    '<input type="text" placeholder="Symbol..." value="' + (window._spreadSym||'') + '" oninput="window._spreadSym=this.value;render()" style="background:var(--bg2);border:1px solid var(--border);color:var(--text);font-family:inherit;font-size:12px;padding:6px 10px;border-radius:var(--radius);height:32px;outline:none;max-width:160px"/>' +
+    '</div>';
+
+  var metricsHTML =
+    acctTabsHTML() +
+    '<div class="metrics">' +
+    '<div class="metric"><div class="metric-label">Total Spreads</div><div class="metric-val">' + filtered.length + '</div></div>' +
+    '<div class="metric"><div class="metric-label">Realized P&L</div><div class="metric-val ' + (totalPnl>=0?'green':'red') + '">' + signStr(totalPnl) + '</div></div>' +
+    '<div class="metric"><div class="metric-label">Win Rate</div><div class="metric-val ' + (winRate>=50?'green':'red') + '">' + winRate + '% (' + winners + '/' + withPnL.length + ')</div></div>' +
+    '<div class="metric"><div class="metric-label">Avg Return</div><div class="metric-val ' + (avgPct>=0?'green':'red') + '">' + pctStr(avgPct) + '</div></div>' +
+    '<div class="metric"><div class="metric-label">Avg APR</div><div class="metric-val ' + (avgApr>=0?'green':'red') + '">' + aprStr(avgApr) + '</div></div>' +
+    '<div class="metric"><div class="metric-label">Total Comm.</div><div class="metric-val red">-' + fmt(totalComm) + '</div></div>' +
+    '</div>';
+
+  var cardsHTML = filtered.length === 0
     ? '<div class="empty"><div class="empty-icon">📋</div>No spreads found. Import your IBKR CSV to see spreads here.</div>'
-    : filtered.map(spreadCard).join('')}`;
+    : filtered.map(makeCard).join('');
+
+  return metricsHTML + filterBtns + cardsHTML;
 }
+
 
 // ── Positions page ────────────────────────────────────────────
 function renderPositions() {
