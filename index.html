@@ -1001,18 +1001,18 @@ function renderSpreads() {
       const role   = isOpen
         ? (t.action === 'SELL' ? 'Open short' : 'Open long')
         : (t.action === 'BUY'  ? 'Close short' : 'Close long');
-      return `
-      <div class="spread-leg">
-        <span>${badge(t.action)}</span>
-        <span style="font-size:10px;color:var(--muted)">${role}</span>
-        <span style="font-weight:600;font-size:11px">${t.symbol.trim()}</span>
-        <span style="text-align:right">${strike}</span>
-        <span style="text-align:right">${t.qty}</span>
-        <span style="text-align:right">${fmt(t.price)}</span>
-        <span style="text-align:right;color:var(--muted)">-${fmt(t.commission)}</span>
-        <span style="text-align:right;font-weight:600" class="${legCls}">${fmtSign(legNet)}</span>
-        <span style="text-align:right;color:var(--muted)">${fmtDShort(t.date)}</span>
-      </div>`;
+      // NOTE: use string concat here — no backticks — to avoid breaking the outer template literal
+      return '<div class="spread-leg">'
+        + '<span>' + badge(t.action) + '</span>'
+        + '<span style="font-size:10px;color:var(--muted)">' + role + '</span>'
+        + '<span style="font-weight:600;font-size:11px">' + t.symbol.trim() + '</span>'
+        + '<span style="text-align:right">' + strike + '</span>'
+        + '<span style="text-align:right">' + t.qty + '</span>'
+        + '<span style="text-align:right">' + fmt(t.price) + '</span>'
+        + '<span style="text-align:right;color:var(--muted)">-' + fmt(t.commission) + '</span>'
+        + '<span style="text-align:right;font-weight:600;color:' + (legNet>=0?'var(--green)':'var(--red)') + '">' + fmtSign(legNet) + '</span>'
+        + '<span style="text-align:right;color:var(--muted)">' + fmtDShort(t.date) + '</span>'
+        + '</div>';
     }).join('');
 
     return `
@@ -1059,10 +1059,7 @@ function renderSpreads() {
           <span class="spread-meta-label">Credit collected</span>
           <span class="spread-meta-val pos">${fmtSign(s.openCredit)}</span>
         </div>
-        ${s.closeDate ? `<div class="spread-meta-item">
-          <span class="spread-meta-label">Debit to close</span>
-          <span class="spread-meta-val neg">${fmtSign(s.closeDebit)}</span>
-        </div>` : ''}
+        ${s.closeDate ? '<div class="spread-meta-item"><span class="spread-meta-label">Debit to close</span><span class="spread-meta-val neg">' + fmtSign(s.closeDebit) + '</span></div>' : ''}
         <div class="spread-meta-item">
           <span class="spread-meta-label">Max risk</span>
           <span class="spread-meta-val neg">-${fmt(s.maxRisk)}</span>
@@ -1095,12 +1092,12 @@ function renderSpreads() {
           <div>
             <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:3px">Return on Credit</div>
             <div style="font-size:22px;font-weight:700" class="${pctCls}">${pctStr}</div>
-            ${s.pctReturn!=null?`<div style="font-size:10px;color:var(--muted);margin-top:2px">of $${s.openCredit.toFixed(0)} collected</div>`:''}
+            ${s.pctReturn!=null ? '<div style="font-size:10px;color:var(--muted);margin-top:2px">of $' + s.openCredit.toFixed(0) + ' collected</div>' : ''}
           </div>
           <div>
             <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:3px">APR</div>
             <div style="font-size:22px;font-weight:700" class="${aprCls}">${aprStr}</div>
-            ${s.apr!=null?`<div style="font-size:10px;color:var(--muted);margin-top:2px">over ${s.daysHeld} days</div>`:''}
+            ${s.apr!=null ? '<div style="font-size:10px;color:var(--muted);margin-top:2px">over ' + s.daysHeld + ' days</div>' : ''}
           </div>
           <div style="margin-left:auto;text-align:right">
             <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:3px">Commissions paid</div>
