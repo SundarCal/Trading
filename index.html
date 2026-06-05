@@ -733,9 +733,12 @@ function acctTabsHTML() {
 }
 
 function connectionBanner() {
-  if (!state.connected) return `<div style="background:#2a1500;border:1px solid var(--orange);border-radius:var(--radius);padding:12px 16px;margin-bottom:16px;font-size:12px;color:var(--orange)">
-    ⚠ Not connected to Google Sheets. <button class="btn" onclick="showPage('setup')" style="margin-left:8px;font-size:11px">Go to Setup →</button>
-  </div>`;
+  if (!state.connected) {
+    var div = document.createElement('div');
+    div.style.cssText = 'background:#2a1500;border:1px solid var(--orange);border-radius:var(--radius);padding:12px 16px;margin-bottom:16px;font-size:12px;color:var(--orange)';
+    div.innerHTML = '⚠ Not connected to Google Sheets. <button class="btn" onclick="showPage(\'setup\')" style="margin-left:8px;font-size:11px">Go to Setup →</button>';
+    return div.outerHTML;
+  }
   return '';
 }
 
