@@ -948,9 +948,12 @@ function buildSpreads(trades) {
       var sl = leg.isShort ? leg   : other;  // short = sold first
       var ll = leg.isShort ? other : leg;    // long  = bought first
 
-      var openCredit = sl.openGross  + ll.openGross;
-      var closeDebit = sl.closeGross + ll.closeGross;
-      var totalGross = openCredit + closeDebit;
+      // openCredit = net premium received at open (sell gross [+] + buy gross [-])
+      var openCredit = sl.openGross + ll.openGross;
+      // closeDebit  = net cost to close = buyback cost - long recovery
+      //   sl.closeGross is negative (paid to buy back short leg)
+      //   ll.closeGross is positive (received from selling long leg)
+      var closeDebit = Math.abs(sl.closeGross || 0) - Math.abs(ll.closeGross || 0);
       var totalComm  = sl.openComm + ll.openComm + sl.closeComm + ll.closeComm;
 
       var closeDate = sl.closeDate || ll.closeDate || null;
@@ -962,10 +965,12 @@ function buildSpreads(trades) {
       var endDate   = closeDate || (isExpired ? expiry : today);
       var daysHeld  = calcDays(sl.openDate, endDate);
 
-      var netPnL   = isClosed ? (totalGross - totalComm) : null;
-      var strikeW  = Math.abs(sl.occ.strike - ll.occ.strike);
-      var qty      = sl.openQty;
-      var maxRisk  = (strikeW * 100 * qty) - openCredit;
+      // Net P&L = openCredit - closeDebit - commissions
+      // Expired worthless: no closeDebit (kept full credit)
+      var netPnL  = isClosed ? (openCredit - (closeDate ? closeDebit : 0) - totalComm) : null;
+      var strikeW = Math.abs(sl.occ.strike - ll.occ.strike);
+      var qty     = sl.openQty;
+      var maxRisk = (strikeW * 100 * qty) - openCredit;
 
       var pctReturn = (isClosed && netPnL != null && openCredit > 0)
         ? (netPnL / openCredit * 100) : null;
